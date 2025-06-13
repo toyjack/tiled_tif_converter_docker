@@ -1,156 +1,198 @@
 #!/bin/bash
 
-# 配置变量
+# 脚本配置
 readonly INPUT_DIR="/app/input"
 readonly OUTPUT_DIR="/app/output"
+readonly DEFAULT_THREADS=${DEFAULT_THREADS:-4}
+readonly MAX_THREADS=${MAX_THREADS:-16}
 
-# 错误处理 - 移除 set -e，手动处理错误
-set -uo pipefail
+# 更严格的错误处理
+# -E: 如果 trap 使用 ERR，则继承 ERR
+# -u: 未定义变量视为错误
+# -o pipefail: 管道中任一命令失败则整个管道失败
+set -Eeuo pipefail
+
+# 脚本退出时调用的清理函数
+trap 'cleanup' EXIT
+cleanup() {
+  # 可在此处添加需要清理的逻辑，例如删除临时文件
+  # log "脚本执行完毕，正在清理..."
+  : # 空命令，什么都不做
+}
 
 # 日志函数
 log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
+  echo >&2 "$(date '+%Y-%m-%d %H:%M:%S') - $1"
 }
 
-# 创建输出目录
-mkdir -p "$OUTPUT_DIR"
+# 依赖检查函数
+check_dependencies() {
+  local missing_deps=()
+  for cmd in vips parallel nproc; do
+    if ! command -v "$cmd" &>/dev/null; then
+      missing_deps+=("$cmd")
+    fi
+  done
+  if [[ ${#missing_deps[@]} -gt 0 ]]; then
+    log "错误: 缺少必要的依赖项: ${missing_deps[*]}. 请先安装它们。"
+    exit 1
+  fi
+}
 
-# 单个文件处理函数
+# 使用帮助
+show_usage() {
+  cat <<EOF
+使用方法: $0 [选项]
+
+选项:
+  -j, --jobs N    设置并行处理的线程数。
+                  'auto' 将使用所有CPU核心数。
+                  (默认: $DEFAULT_THREADS, 最大: $MAX_THREADS)
+  -h, --help      显示此帮助信息
+
+示例:
+  $0              # 使用默认线程数 ($DEFAULT_THREADS)
+  $0 -j 8         # 使用8个线程
+  $0 --jobs auto  # 自动检测并使用所有CPU核心数
+EOF
+}
+
+# 获取并验证线程数
+get_thread_count() {
+  local requested_threads="$1"
+  local cpu_cores
+  cpu_cores=$(nproc)
+
+  if [[ "$requested_threads" == "auto" ]]; then
+    requested_threads=$cpu_cores
+  elif ! [[ "$requested_threads" =~ ^[0-9]+$ ]]; then
+    log "错误: 线程数必须是一个正整数。"
+    exit 1
+  fi
+
+  if [[ "$requested_threads" -gt $MAX_THREADS ]]; then
+    log "警告: 请求的线程数 ($requested_threads) 超过最大限制 ($MAX_THREADS)，将使用最大限制。"
+    requested_threads=$MAX_THREADS
+  fi
+
+  if [[ "$requested_threads" -lt 1 ]]; then
+    requested_threads=1
+  fi
+
+  echo "$requested_threads"
+}
+
+# 单个文件处理函数 (已简化)
 process_single_file() {
-    local input_file="$1"
-    local relative_path="${input_file#$INPUT_DIR/}"
-    local output_file="$OUTPUT_DIR/${relative_path%.*}.tif"
-    local output_dir
-    output_dir=$(dirname "$output_file")
-    
-    # 跳过已存在的文件
-    if [[ -f "$output_file" ]]; then
-        return 2  # 返回特殊代码表示跳过
-    fi
-    
-    # 创建输出目录
-    mkdir -p "$output_dir"
-    
-    # 执行转换
-    if vips im_vips2tiff "$input_file" "$output_file:deflate,tile:256x256,pyramid" 2>/dev/null; then
-        return 0  # 成功
-    else
-        rm -f "$output_file" 2>/dev/null || true  # 清理失败的文件
-        return 1  # 失败
-    fi
-}
+  local input_file="$1"
+  # 使用 basename 和 dirname 提高可读性和稳健性
+  local filename
+  filename=$(basename "$input_file")
+  local relative_dir
+  relative_dir=$(dirname "${input_file#$INPUT_DIR/}")
 
-# 获取文件列表
-get_tiff_files() {
-    find "$INPUT_DIR" -type f \( -iname "*.tif" -o -iname "*.tiff" \) 2>/dev/null || true
-}
+  # 构建输出路径
+  local output_dir="$OUTPUT_DIR/$relative_dir"
+  local output_file="$output_dir/${filename%.*}.tif"
 
-# 统计文件数量
-count_files() {
-    get_tiff_files | wc -l
-}
+  # ✅ 核心优化：在任务内部检查文件是否存在，而不是预先计算
+  if [[ -f "$output_file" ]]; then
+    # GNU Parallel 的 --joblog 会记录此信息，无需手动打印日志
+    # echo "SKIP: $input_file"
+    return 0 # 返回成功状态码，表示“已处理”
+  fi
 
-# 统计已完成文件数量
-count_completed_files() {
-    local count=0
-    while IFS= read -r -d '' input_file; do
-        local relative_path="${input_file#$INPUT_DIR/}"
-        local output_file="$OUTPUT_DIR/${relative_path%.*}.tif"
-        [[ -f "$output_file" ]] && ((count++))
-    done < <(get_tiff_files | tr '\n' '\0')
-    echo "$count"
+  # 确保输出目录存在
+  mkdir -p "$output_dir"
+
+  # 执行转换，隐藏 vips 的标准输出，但保留标准错误用于调试
+  if vips im_vips2tiff "$input_file" "$output_file:deflate,tile:256x256,pyramid" >/dev/null; then
+    # 成功，无需日志，joblog会记录
+    return 0
+  else
+    # 失败，记录错误并清理
+    log "✗ 转换失败: $input_file"
+    rm -f "$output_file"
+    return 1 # 返回失败状态码
+  fi
 }
+# 导出函数和只读变量给 parallel 使用
+export -f process_single_file log
+export INPUT_DIR OUTPUT_DIR
 
 # 主函数
 main() {
-    log "开始TIFF文件处理任务"
-    
-    # 检查输入目录
-    if [[ ! -d "$INPUT_DIR" ]]; then
-        log "错误: 输入目录不存在: $INPUT_DIR"
-        exit 1
-    fi
-    
-    # 统计文件
-    log "正在统计文件数量..."
-    local total_files
-    total_files=$(count_files)
-    
-    if [[ "$total_files" -eq 0 ]]; then
-        log "未找到TIFF文件，退出"
+  # 检查依赖
+  check_dependencies
+
+  local thread_count_req="$DEFAULT_THREADS"
+
+  # 使用 getopts 进行更标准的参数解析
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -j|--jobs)
+        thread_count_req="${2:?错误: --jobs 需要一个参数}"
+        shift 2
+        ;;
+      -h|--help)
+        show_usage
         exit 0
-    fi
-    
-    local completed_files
-    completed_files=$(count_completed_files)
-    local remaining_files=$((total_files - completed_files))
-    
-    # 显示统计信息
-    log "文件统计:"
-    log "  总文件数: $total_files"
-    log "  已完成: $completed_files"
-    log "  待处理: $remaining_files"
-    
-    # 检查是否需要处理
-    if [[ "$remaining_files" -eq 0 ]]; then
-        log "所有文件已处理完成"
-        exit 0
-    fi
-    
-    # 开始单线程处理
-    log "开始处理文件..."
-    
-    local processed=0
-    local failed=0
-    local skipped=0
-    
-    while IFS= read -r -d '' input_file; do
-        local relative_path="${input_file#$INPUT_DIR/}"
-        ((processed++))
-        local percentage=$((processed * 100 / total_files))
-        
-        # 处理文件 - 直接调用函数并检查返回值
-        process_single_file "$input_file"
-        local exit_code=$?
-        
-        case $exit_code in
-            0)  # 成功
-                log "✓ 已完成: $relative_path (进度: $processed/$total_files - $percentage%)"
-                ;;
-            1)  # 失败
-                ((failed++))
-                log "✗ 失败: $relative_path (进度: $processed/$total_files - $percentage%)"
-                ;;
-            2)  # 跳过
-                ((skipped++))
-                log "跳过已存在文件: $relative_path (进度: $processed/$total_files - $percentage%)"
-                ;;
-        esac
-        
-    done < <(get_tiff_files | tr '\n' '\0')
-    
-    # 显示最终统计
-    log "处理完成统计:"
-    log "  总处理文件: $processed"
-    log "  跳过文件: $skipped"
-    log "  处理失败: $failed"
-    log "  处理成功: $((processed - skipped - failed))"
-    
-    if [[ "$failed" -gt 0 ]]; then
-        log "处理过程中有 $failed 个文件失败"
+        ;;
+      *)
+        log "错误: 未知参数 '$1'"
+        show_usage
         exit 1
-    else
-        log "所有文件处理完成"
-    fi
+        ;;
+    esac
+  done
+
+  local thread_count
+  thread_count=$(get_thread_count "$thread_count_req")
+
+  # 检查输入目录
+  if [[ ! -d "$INPUT_DIR" ]]; then
+    log "错误: 输入目录不存在: $INPUT_DIR"
+    exit 1
+  fi
+
+  # 创建输出目录
+  mkdir -p "$OUTPUT_DIR"
+
+  log "正在查找 TIFF 文件..."
+  # ✅ 核心优化：使用 NUL 分隔符处理特殊文件名
+  # 将文件列表读入数组，避免多次调用 find
+  mapfile -d '' files_to_process < <(find "$INPUT_DIR" -type f \( -iname "*.tif" -o -iname "*.tiff" \) -print0)
+
+  local total_files=${#files_to_process[@]}
+
+  if [[ "$total_files" -eq 0 ]]; then
+    log "在 $INPUT_DIR 中未找到 TIFF 文件，任务完成。"
+    exit 0
+  fi
+
+  log "找到 $total_files 个文件。开始使用 $thread_count 个线程进行处理..."
+  log "可以使用 'tail -f /tmp/tiff_conversion.log' 查看详细任务日志。"
+
+  # ✅ 核心优化：使用 parallel 的内置功能
+  # --bar: 显示进度条
+  # --eta: 显示预计剩余时间
+  # --joblog: 将每个任务的详细信息（开始/结束时间、退出码、标准输出/错误）记录到文件
+  # --null: 表示输入由 NUL (\0) 字符分隔
+  # printf "%s\0" ... | parallel: 安全地将数组内容通过管道传递给 parallel
+  if printf "%s\0" "${files_to_process[@]}" | \
+    parallel \
+      --null \
+      --bar \
+      --eta \
+      -j "$thread_count" \
+      --joblog /tmp/tiff_conversion.log \
+      process_single_file {}; then
+    log "✅ 所有文件处理成功。"
+  else
+    log "⚠️ 部分文件处理失败。请检查日志 /tmp/tiff_conversion.log 获取详情。"
+    exit 1
+  fi
 }
 
-# 清理函数
-cleanup() {
-    log "清理完成"
-}
-
-# 设置退出时清理
-trap cleanup EXIT
-
-# 执行主函数
+# 执行主函数，并传递所有命令行参数
 main "$@"
