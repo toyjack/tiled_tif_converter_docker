@@ -8,3 +8,8 @@ services:
       - QUALITY=85
       - FORMAT=webp
       - PARALLEL_JOBS=4
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+          cpus: '10.0'
