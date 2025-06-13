@@ -1,0 +1,10 @@
+services:
+  image-processor:
+    build: .
+    volumes:
+      - ${INPUT_FOLDER:-./input}:/app/input:ro
+      - ${OUTPUT_FOLDER:-./output}:/app/output
+    environment:
+      - QUALITY=85
+      - FORMAT=webp
+      - PARALLEL_JOBS=4
