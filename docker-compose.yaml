@@ -5,11 +5,5 @@ services:
       - ${INPUT_FOLDER:-./input}:/app/input:ro
       - ${OUTPUT_FOLDER:-./output}:/app/output
     environment:
-      - QUALITY=85
-      - FORMAT=webp
-      - PARALLEL_JOBS=4
-    deploy:
-      resources:
-        limits:
-          memory: 32G
-          cpus: '10.0'
+      - DEFAULT_THREADS=${DEFAULT_THREADS:-4}
+      - MAX_THREADS=${MAX_THREADS:-16}
