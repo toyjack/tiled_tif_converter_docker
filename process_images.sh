@@ -4,22 +4,12 @@
 readonly INPUT_DIR="/app/input"
 readonly OUTPUT_DIR="/app/output"
 
-# 错误处理
-set -euo pipefail
+# 错误处理 - 移除 set -e，手动处理错误
+set -uo pipefail
 
 # 日志函数
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
-}
-
-# 安全更新进度计数器
-update_progress() {
-    (
-        flock -x 200
-        echo "1" >> /tmp/progress_counter
-        local current_count=$(wc -l < /tmp/progress_counter)
-        echo "$current_count"
-    ) 200>/tmp/progress_counter.lock
 }
 
 # 创建输出目录
@@ -35,9 +25,7 @@ process_single_file() {
     
     # 跳过已存在的文件
     if [[ -f "$output_file" ]]; then
-        local current_count=$(update_progress)
-        log "跳过已存在文件: $relative_path (进度: $current_count/$TOTAL_FILES)"
-        return 0
+        return 2  # 返回特殊代码表示跳过
     fi
     
     # 创建输出目录
@@ -45,15 +33,10 @@ process_single_file() {
     
     # 执行转换
     if vips im_vips2tiff "$input_file" "$output_file:deflate,tile:256x256,pyramid" 2>/dev/null; then
-        local current_count=$(update_progress)
-        local percentage=$((current_count * 100 / TOTAL_FILES))
-        log "✓ 已完成: $relative_path (进度: $current_count/$TOTAL_FILES - $percentage%)"
+        return 0  # 成功
     else
-        local current_count=$(update_progress)
-        local percentage=$((current_count * 100 / TOTAL_FILES))
-        log "✗ 失败: $relative_path (进度: $current_count/$TOTAL_FILES - $percentage%)"
-        rm -f "$output_file"  # 清理失败的文件
-        return 1
+        rm -f "$output_file" 2>/dev/null || true  # 清理失败的文件
+        return 1  # 失败
     fi
 }
 
@@ -114,33 +97,56 @@ main() {
         exit 0
     fi
     
-    # 初始化进度计数器
-    rm -f /tmp/progress_counter /tmp/progress_counter.lock
-    touch /tmp/progress_counter
-    # 预填已完成的文件数
-    for ((i=1; i<=completed_files; i++)); do
-        echo "1" >> /tmp/progress_counter
-    done
+    # 开始单线程处理
+    log "开始处理文件..."
     
-    # 导出变量和函数供parallel使用
-    export -f process_single_file log update_progress
-    export INPUT_DIR OUTPUT_DIR TOTAL_FILES=$total_files
+    local processed=0
+    local failed=0
+    local skipped=0
     
-    # 开始并行处理
-    log "开始并行处理文件..."
+    while IFS= read -r -d '' input_file; do
+        local relative_path="${input_file#$INPUT_DIR/}"
+        ((processed++))
+        local percentage=$((processed * 100 / total_files))
+        
+        # 处理文件 - 直接调用函数并检查返回值
+        process_single_file "$input_file"
+        local exit_code=$?
+        
+        case $exit_code in
+            0)  # 成功
+                log "✓ 已完成: $relative_path (进度: $processed/$total_files - $percentage%)"
+                ;;
+            1)  # 失败
+                ((failed++))
+                log "✗ 失败: $relative_path (进度: $processed/$total_files - $percentage%)"
+                ;;
+            2)  # 跳过
+                ((skipped++))
+                log "跳过已存在文件: $relative_path (进度: $processed/$total_files - $percentage%)"
+                ;;
+        esac
+        
+    done < <(get_tiff_files | tr '\n' '\0')
     
-    if get_tiff_files | parallel -j+0 --will-cite process_single_file {}; then
-        log "所有文件处理完成"
-    else
-        log "处理过程中出现错误，请检查日志"
+    # 显示最终统计
+    log "处理完成统计:"
+    log "  总处理文件: $processed"
+    log "  跳过文件: $skipped"
+    log "  处理失败: $failed"
+    log "  处理成功: $((processed - skipped - failed))"
+    
+    if [[ "$failed" -gt 0 ]]; then
+        log "处理过程中有 $failed 个文件失败"
         exit 1
+    else
+        log "所有文件处理完成"
     fi
 }
 
 # 清理函数
 cleanup() {
-    log "清理临时文件..."
-    rm -f /tmp/progress_counter /tmp/progress_counter.lock
+    log "清理完成"
 }
 
 # 设置退出时清理
