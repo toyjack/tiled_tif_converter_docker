@@ -27,32 +27,6 @@ log() {
   echo >&2 "$(date '+%Y-%m-%d %H:%M:%S') - $1"
 }
 
-# 获取并验证线程数
-get_thread_count() {
-  local requested_threads="$1"
-  local cpu_cores
-  cpu_cores=$(nproc)
-
-  if [[ "$requested_threads" == "auto" ]]; then
-    requested_threads=$cpu_cores
-  elif ! [[ "$requested_threads" =~ ^[0-9]+$ ]]; then
-    log "错误: 线程数必须是一个正整数。"
-    exit 1
-  fi
-
-  # 限制最大线程数为 CPU 核心数的 2 倍
-  local max_threads=$((cpu_cores * 2))
-  if [[ "$requested_threads" -gt $max_threads ]]; then
-    log "警告: 请求的线程数 ($requested_threads) 超过推荐最大值 ($max_threads)，将使用最大值。"
-    requested_threads=$max_threads
-  fi
-
-  if [[ "$requested_threads" -lt 1 ]]; then
-    requested_threads=1
-  fi
-
-  echo "$requested_threads"
-}
 
 # 本地缓存处理单个文件
 process_single_file_cached() {
@@ -186,9 +160,6 @@ export INPUT_DIR OUTPUT_DIR LOCAL_CACHE_DIR USE_LOCAL_CACHE
 
 # 主函数
 main() {
-  local thread_count_req="$THREADS"
-  local thread_count
-  thread_count=$(get_thread_count "$thread_count_req")
 
   # 检查输入目录
   if [[ ! -d "$INPUT_DIR" ]]; then
@@ -202,14 +173,21 @@ main() {
   log "正在查找 TIFF 文件..."
   # ✅ 核心优化：使用 NUL 分隔符处理特殊文件名
   # 将文件列表读入数组，避免多次调用 find
-  mapfile -d '' files_to_process < <(find "$INPUT_DIR" -type f \( -iname "*.tif" -o -iname "*.tiff" \) -print0)
+  mapfile -d '' all_files < <(find "$INPUT_DIR" -type f \( -iname "*.tif" -o -iname "*.tiff" \) -print0)
 
-  local total_files=${#files_to_process[@]}
+  local total_found=${#all_files[@]}
 
-  if [[ "$total_files" -eq 0 ]]; then
+  if [[ "$total_found" -eq 0 ]]; then
     log "在 $INPUT_DIR 中未找到 TIFF 文件，任务完成。"
     exit 0
   fi
+
+  # 暂时跳过预过滤，让 parallel 处理时再检查
+  # 这样可以避免启动时的性能瓶颈
+  local files_to_process=("${all_files[@]}")
+  local total_files=${#files_to_process[@]}
+  
+  log "找到 $total_files 个文件待处理（已转换文件将在处理时跳过）。"
 
   # 初始化本地缓存
   if [[ "$USE_LOCAL_CACHE" == "true" ]]; then
@@ -220,7 +198,7 @@ main() {
     mkdir -p "$LOCAL_CACHE_DIR/input" "$LOCAL_CACHE_DIR/output"
   fi
 
-  log "找到 $total_files 个文件。开始使用 $thread_count 个线程进行处理..."
+  log "开始使用 $THREADS 个线程进行处理..."
   log "可以使用 'tail -f /tmp/tiff_conversion.log' 查看详细任务日志。"
 
   # ✅ 核心优化：使用 parallel 的内置功能
@@ -234,7 +212,7 @@ main() {
       --null \
       --bar \
       --eta \
-      -j "$thread_count" \
+      -j "$THREADS" \
       --joblog /tmp/tiff_conversion.log \
       process_file_wrapper {}; then
     log "✅ 所有文件处理成功。"
