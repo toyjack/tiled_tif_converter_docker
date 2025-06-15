@@ -1,20 +1,48 @@
-FROM alpine:latest
+# 多阶段构建，使用固定版本标签
+FROM alpine:3.22 AS base
 
-# 安装 libvips 和依赖
-RUN apk update && \
-    apk add --no-cache \
-    vips-dev \
-    vips-tools \
-    imagemagick \
+# 设置标签信息
+LABEL maintainer="libvips-docker" \
+      version="1.0.0" \
+      description="High-performance TIFF image processing with libvips"
+
+# 安装运行时依赖
+RUN apk add --no-cache \
+    vips=8.16.1-r0 \
+    vips-tools=8.16.1-r0 \
     parallel \
     bash \
-    pv
+    pv \
+    tini \
+    && rm -rf /var/cache/apk/* \
+    && rm -rf /tmp/*
+
+# 创建非 root 用户
+RUN addgroup -g 1000 vipsuser && \
+    adduser -D -s /bin/bash -u 1000 -G vipsuser vipsuser
+
+# 创建必要的目录
+RUN mkdir -p /app/input /app/output /app/logs && \
+    chown -R vipsuser:vipsuser /app
 
 # 设置工作目录
 WORKDIR /app
 
-# 复制处理脚本（确保脚本存在）
-COPY process_images.sh /app/process_images.sh
+# 复制处理脚本并设置权限
+COPY --chown=vipsuser:vipsuser process_images.sh /app/
 RUN chmod +x /app/process_images.sh
 
-ENTRYPOINT ["/app/process_images.sh"]
+# 切换到非 root 用户
+USER vipsuser
+
+# 设置环境变量
+ENV INPUT_DIR=/app/input \
+    OUTPUT_DIR=/app/output \
+    THREADS=4
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD pgrep -f "process_images.sh" > /dev/null || exit 1
+
+# 使用 tini 作为 init 进程
+ENTRYPOINT ["/sbin/tini", "--", "/app/process_images.sh"]

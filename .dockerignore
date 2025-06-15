@@ -1,0 +1,95 @@
+# Git 相关
+.git
+.gitignore
+.gitattributes
+
+# 环境配置文件
+.env
+.env.*
+!.env.example
+
+# 输入输出目录
+input/
+output/
+logs/
+
+# IDE 和编辑器文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.temp
+*.log
+*.pid
+*.seed
+*.pid.lock
+
+# 文档和说明文件
+README.md
+README.txt
+CHANGELOG.md
+LICENSE
+*.md
+!CLAUDE.md
+
+# Docker 相关
+Dockerfile.*
+docker-compose.override.yml
+docker-compose.*.yml
+!docker-compose.yaml
+
+# 备份文件
+*.bak
+*.backup
+*.old
+
+# 测试文件
+test/
+tests/
+*.test
+spec/
+
+# 节点模块（如果有）
+node_modules/
+
+# Python 相关（如果有）
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 其他不需要的文件
+*.tar
+*.tar.gz
+*.zip
+*.rar
+*.7z

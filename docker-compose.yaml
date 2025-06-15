@@ -1,9 +1,30 @@
 services:
   image-processor:
     build: .
+    container_name: libvips-processor
+    restart: unless-stopped
+    
     volumes:
       - ${INPUT_FOLDER:-./input}:/app/input:ro
       - ${OUTPUT_FOLDER:-./output}:/app/output
+    
     environment:
-      - DEFAULT_THREADS=${DEFAULT_THREADS:-4}
-      - MAX_THREADS=${MAX_THREADS:-16}
+      - THREADS=${THREADS:-4}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - TZ=${TZ:-UTC}
+    
+    # 资源限制（CPU 限制基于线程数）
+    deploy:
+      resources:
+        limits:
+          memory: ${MEMORY_LIMIT:-2G}
+          cpus: '${THREADS:-4}.0'
+        reservations:
+          memory: 512M
+          cpus: '1.0'
+    
+    # 安全配置
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=100m

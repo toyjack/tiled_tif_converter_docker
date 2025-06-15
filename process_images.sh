@@ -3,8 +3,7 @@
 # 脚本配置
 readonly INPUT_DIR="/app/input"
 readonly OUTPUT_DIR="/app/output"
-readonly DEFAULT_THREADS=${DEFAULT_THREADS:-4}
-readonly MAX_THREADS=${MAX_THREADS:-16}
+readonly THREADS=${THREADS:-4}
 
 # 更严格的错误处理
 # -E: 如果 trap 使用 ERR，则继承 ERR
@@ -38,9 +37,11 @@ get_thread_count() {
     exit 1
   fi
 
-  if [[ "$requested_threads" -gt $MAX_THREADS ]]; then
-    log "警告: 请求的线程数 ($requested_threads) 超过最大限制 ($MAX_THREADS)，将使用最大限制。"
-    requested_threads=$MAX_THREADS
+  # 限制最大线程数为 CPU 核心数的 2 倍
+  local max_threads=$((cpu_cores * 2))
+  if [[ "$requested_threads" -gt $max_threads ]]; then
+    log "警告: 请求的线程数 ($requested_threads) 超过推荐最大值 ($max_threads)，将使用最大值。"
+    requested_threads=$max_threads
   fi
 
   if [[ "$requested_threads" -lt 1 ]]; then
@@ -90,7 +91,7 @@ export INPUT_DIR OUTPUT_DIR
 
 # 主函数
 main() {
-  local thread_count_req="$DEFAULT_THREADS"
+  local thread_count_req="$THREADS"
   local thread_count
   thread_count=$(get_thread_count "$thread_count_req")
 
