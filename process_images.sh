@@ -25,38 +25,6 @@ log() {
   echo >&2 "$(date '+%Y-%m-%d %H:%M:%S') - $1"
 }
 
-# 依赖检查函数
-check_dependencies() {
-  local missing_deps=()
-  for cmd in vips parallel nproc; do
-    if ! command -v "$cmd" &>/dev/null; then
-      missing_deps+=("$cmd")
-    fi
-  done
-  if [[ ${#missing_deps[@]} -gt 0 ]]; then
-    log "错误: 缺少必要的依赖项: ${missing_deps[*]}. 请先安装它们。"
-    exit 1
-  fi
-}
-
-# 使用帮助
-show_usage() {
-  cat <<EOF
-使用方法: $0 [选项]
-
-选项:
-  -j, --jobs N    设置并行处理的线程数。
-                  'auto' 将使用所有CPU核心数。
-                  (默认: $DEFAULT_THREADS, 最大: $MAX_THREADS)
-  -h, --help      显示此帮助信息
-
-示例:
-  $0              # 使用默认线程数 ($DEFAULT_THREADS)
-  $0 -j 8         # 使用8个线程
-  $0 --jobs auto  # 自动检测并使用所有CPU核心数
-EOF
-}
-
 # 获取并验证线程数
 get_thread_count() {
   local requested_threads="$1"
@@ -122,30 +90,7 @@ export INPUT_DIR OUTPUT_DIR
 
 # 主函数
 main() {
-  # 检查依赖
-  check_dependencies
-
   local thread_count_req="$DEFAULT_THREADS"
-
-  # 使用 getopts 进行更标准的参数解析
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -j|--jobs)
-        thread_count_req="${2:?错误: --jobs 需要一个参数}"
-        shift 2
-        ;;
-      -h|--help)
-        show_usage
-        exit 0
-        ;;
-      *)
-        log "错误: 未知参数 '$1'"
-        show_usage
-        exit 1
-        ;;
-    esac
-  done
-
   local thread_count
   thread_count=$(get_thread_count "$thread_count_req")
 
