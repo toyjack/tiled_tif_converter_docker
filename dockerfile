@@ -17,13 +17,8 @@ RUN apk add --no-cache \
     && rm -rf /var/cache/apk/* \
     && rm -rf /tmp/*
 
-# 创建非 root 用户
-RUN addgroup -g 1000 vipsuser && \
-    adduser -D -s /bin/bash -u 1000 -G vipsuser vipsuser
-
 # 创建必要的目录
-RUN mkdir -p /app/input /app/output /app/logs && \
-    chown -R vipsuser:vipsuser /app
+RUN mkdir -p /app/input /app/output /app/logs
 
 # 设置工作目录
 WORKDIR /app

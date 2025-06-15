@@ -4,6 +4,9 @@
 readonly INPUT_DIR="/app/input"
 readonly OUTPUT_DIR="/app/output"
 readonly THREADS=${THREADS:-4}
+readonly LOCAL_CACHE_DIR="/tmp/cache"
+readonly BATCH_SIZE=${BATCH_SIZE:-10}  # 每批处理的文件数量
+readonly USE_LOCAL_CACHE=${USE_LOCAL_CACHE:-true}  # 是否启用本地缓存
 
 # 更严格的错误处理
 # -E: 如果 trap 使用 ERR，则继承 ERR
@@ -51,6 +54,88 @@ get_thread_count() {
   echo "$requested_threads"
 }
 
+# 本地缓存处理单个文件
+process_single_file_cached() {
+  local input_file="$1"
+  local filename
+  filename=$(basename "$input_file")
+  local relative_dir
+  relative_dir=$(dirname "${input_file#$INPUT_DIR/}")
+
+  # 构建输出路径
+  local output_dir="$OUTPUT_DIR/$relative_dir"
+  local output_file="$output_dir/${filename%.*}.tif"
+
+  # 跳过已存在的文件
+  if [[ -f "$output_file" ]]; then
+    return 0
+  fi
+
+  # 确保输出目录存在
+  mkdir -p "$output_dir"
+
+  # 本地缓存路径
+  local cache_input="$LOCAL_CACHE_DIR/input/$filename"
+  local cache_output="$LOCAL_CACHE_DIR/output/${filename%.*}.tif"
+  
+  # 创建缓存目录
+  mkdir -p "$LOCAL_CACHE_DIR/input" "$LOCAL_CACHE_DIR/output"
+
+  # 复制到本地缓存
+  if ! cp "$input_file" "$cache_input" 2>/dev/null; then
+    log "✗ 复制到缓存失败: $input_file"
+    return 1
+  fi
+
+  # 本地处理
+  if vips im_vips2tiff "$cache_input" "$cache_output:deflate,tile:256x256,pyramid" >/dev/null 2>&1; then
+    # 复制回NFS
+    if cp "$cache_output" "$output_file" 2>/dev/null; then
+      # 清理本地缓存
+      rm -f "$cache_input" "$cache_output"
+      return 0
+    else
+      log "✗ 复制回NFS失败: $input_file"
+      rm -f "$cache_input" "$cache_output" "$output_file"
+      return 1
+    fi
+  else
+    log "✗ 转换失败: $input_file"
+    rm -f "$cache_input" "$cache_output" "$output_file"
+    return 1
+  fi
+}
+
+# 直接处理单个文件（无缓存）
+process_single_file_direct() {
+  local input_file="$1"
+  local filename
+  filename=$(basename "$input_file")
+  local relative_dir
+  relative_dir=$(dirname "${input_file#$INPUT_DIR/}")
+
+  # 构建输出路径
+  local output_dir="$OUTPUT_DIR/$relative_dir"
+  local output_file="$output_dir/${filename%.*}.tif"
+
+  # 跳过已存在的文件
+  if [[ -f "$output_file" ]]; then
+    return 0
+  fi
+
+  # 确保输出目录存在
+  mkdir -p "$output_dir"
+
+  # 执行转换
+  if vips im_vips2tiff "$input_file" "$output_file:deflate,tile:256x256,pyramid" >/dev/null; then
+    return 0
+  else
+    log "✗ 转换失败: $input_file"
+    rm -f "$output_file"
+    return 1
+  fi
+}
+
 # 单个文件处理函数 (已简化)
 process_single_file() {
   local input_file="$1"
@@ -85,9 +170,19 @@ process_single_file() {
     return 1 # 返回失败状态码
   fi
 }
+
+# 包装函数，根据配置选择处理方式
+process_file_wrapper() {
+  if [[ "$USE_LOCAL_CACHE" == "true" ]]; then
+    process_single_file_cached "$@"
+  else
+    process_single_file "$@"
+  fi
+}
+
 # 导出函数和只读变量给 parallel 使用
-export -f process_single_file log
-export INPUT_DIR OUTPUT_DIR
+export -f process_file_wrapper process_single_file_cached process_single_file_direct process_single_file log
+export INPUT_DIR OUTPUT_DIR LOCAL_CACHE_DIR USE_LOCAL_CACHE
 
 # 主函数
 main() {
@@ -116,6 +211,15 @@ main() {
     exit 0
   fi
 
+  # 初始化本地缓存
+  if [[ "$USE_LOCAL_CACHE" == "true" ]]; then
+    log "启用本地缓存模式，缓存目录: $LOCAL_CACHE_DIR"
+    mkdir -p "$LOCAL_CACHE_DIR/input" "$LOCAL_CACHE_DIR/output"
+    # 清理旧缓存
+    rm -rf "$LOCAL_CACHE_DIR"/*
+    mkdir -p "$LOCAL_CACHE_DIR/input" "$LOCAL_CACHE_DIR/output"
+  fi
+
   log "找到 $total_files 个文件。开始使用 $thread_count 个线程进行处理..."
   log "可以使用 'tail -f /tmp/tiff_conversion.log' 查看详细任务日志。"
 
@@ -132,7 +236,7 @@ main() {
       --eta \
       -j "$thread_count" \
       --joblog /tmp/tiff_conversion.log \
-      process_single_file {}; then
+      process_file_wrapper {}; then
     log "✅ 所有文件处理成功。"
   else
     log "⚠️ 部分文件处理失败。请检查日志 /tmp/tiff_conversion.log 获取详情。"

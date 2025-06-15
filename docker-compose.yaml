@@ -3,9 +3,6 @@ services:
     build: .
     container_name: libvips-processor
     restart: unless-stopped
-    tty: true
-    stdin_open: true
-    # user: "1000:1000"  # 使用 root 用户处理权限
     
     volumes:
       - ${INPUT_FOLDER:-./input}:/app/input:ro
@@ -15,6 +12,8 @@ services:
       - THREADS=${THREADS:-4}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TZ=${TZ:-UTC}
+      - USE_LOCAL_CACHE=${USE_LOCAL_CACHE:-true}
+      - BATCH_SIZE=${BATCH_SIZE:-10}
     
     # 资源限制（CPU 限制基于线程数）
     deploy:
