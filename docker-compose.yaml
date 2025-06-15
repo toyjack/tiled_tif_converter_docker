@@ -3,6 +3,9 @@ services:
     build: .
     container_name: libvips-processor
     restart: unless-stopped
+    tty: true
+    stdin_open: true
+    # user: "1000:1000"  # 使用 root 用户处理权限
     
     volumes:
       - ${INPUT_FOLDER:-./input}:/app/input:ro

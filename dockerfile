@@ -32,8 +32,8 @@ WORKDIR /app
 COPY --chown=vipsuser:vipsuser process_images.sh /app/
 RUN chmod +x /app/process_images.sh
 
-# 切换到非 root 用户
-USER vipsuser
+# 保持 root 用户以处理权限问题
+# USER vipsuser
 
 # 设置环境变量
 ENV INPUT_DIR=/app/input \
