@@ -567,13 +567,7 @@ initialize_environment() {
   ensure_directory "$ACTIVE_LOG_DIR" || exit 1
   
   # 智能磁盘空间管理
-  log "检查磁盘空间..."
-  
-  # 检查输出目录空间
-  if ! check_disk_space "$OUTPUT_DIR" 100; then
-    error "输出目录空间不足"
-    exit 1
-  fi
+  log "检查工作目录磁盘空间..."
   
   # 选择最佳工作目录
   local work_dir
