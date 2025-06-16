@@ -30,4 +30,4 @@ services:
     security_opt:
       - no-new-privileges:true
     tmpfs:
-      - /tmp:noexec,nosuid,size=2g
+      - /tmp:noexec,nosuid,size=4g
