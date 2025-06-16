@@ -22,6 +22,11 @@ readonly LOCAL_CACHE_DIR="/tmp/cache"
 readonly LOG_DIR="/tmp/logs"
 readonly JOB_LOG="$LOG_DIR/tiff_conversion.log"
 
+# 磁盘空间配置
+readonly MIN_FREE_SPACE_MB=${MIN_FREE_SPACE_MB:-1024}  # 最小剩余空间1GB
+readonly PARALLEL_TMPDIR=${PARALLEL_TMPDIR:-/tmp}      # Parallel临时目录
+readonly MAX_CACHE_FILES=${MAX_CACHE_FILES:-50}        # 最大同时缓存文件数
+
 # 处理配置
 readonly VIPS_ARGS="--compression=deflate --tile --tile-width=256 --tile-height=256 --pyramid"
 readonly PROGRESS_INTERVAL=100
@@ -76,6 +81,61 @@ safe_cleanup() {
   for file in "$@"; do
     [[ -f "$file" ]] && rm -f "$file" 2>/dev/null || true
   done
+}
+
+# 检查磁盘空间
+check_disk_space() {
+  local dir="$1"
+  local min_mb="${2:-$MIN_FREE_SPACE_MB}"
+  
+  # 获取可用空间（MB）
+  local available_mb
+  available_mb=$(df "$dir" 2>/dev/null | awk 'NR==2 {printf "%.0f", $4/1024}')
+  
+  if [[ -z "$available_mb" || "$available_mb" -lt "$min_mb" ]]; then
+    error "磁盘空间不足: $dir 仅剩 ${available_mb}MB，需要至少 ${min_mb}MB"
+    return 1
+  fi
+  
+  log "磁盘空间检查: $dir 可用 ${available_mb}MB"
+  return 0
+}
+
+# 清理过期的临时文件
+cleanup_temp_files() {
+  local temp_dir="$1"
+  local max_age_minutes="${2:-60}"
+  
+  if [[ -d "$temp_dir" ]]; then
+    # 清理超过指定时间的临时文件
+    find "$temp_dir" -type f -mmin +$max_age_minutes -delete 2>/dev/null || true
+    # 清理空目录
+    find "$temp_dir" -type d -empty -delete 2>/dev/null || true
+  fi
+}
+
+# 管理缓存文件数量
+manage_cache_size() {
+  local cache_dir="$1"
+  local max_files="$2"
+  
+  if [[ ! -d "$cache_dir" ]]; then
+    return 0
+  fi
+  
+  # 统计当前缓存文件数
+  local current_files
+  current_files=$(find "$cache_dir" -type f | wc -l)
+  
+  if [[ "$current_files" -gt "$max_files" ]]; then
+    log "缓存文件过多($current_files)，清理最旧的文件..."
+    # 删除最旧的文件，保留最新的max_files个
+    find "$cache_dir" -type f -printf '%T@ %p\n' | \
+      sort -n | \
+      head -n -$max_files | \
+      cut -d' ' -f2- | \
+      xargs -r rm -f
+  fi
 }
 
 # ============================== 路径处理函数 ==============================
@@ -156,7 +216,7 @@ execute_vips_conversion() {
   vips tiffsave "$input_file" "$output_file" $VIPS_ARGS >/dev/null 2>&1
 }
 
-# 缓存模式处理文件
+# 缓存模式处理文件（优化磁盘空间管理）
 process_file_cached() {
   local input_file="$1"
   local output_file
@@ -164,6 +224,15 @@ process_file_cached() {
   
   # 跳过已存在的文件
   should_process_file "$output_file" || return 0
+  
+  # 检查磁盘空间
+  if ! check_disk_space "/tmp" 500; then  # 至少需要500MB
+    error "缓存空间不足，跳过文件: $input_file"
+    return 1
+  fi
+  
+  # 管理缓存大小
+  manage_cache_size "$LOCAL_CACHE_DIR" "$MAX_CACHE_FILES"
   
   # 确保输出目录存在
   ensure_directory "$(dirname "$output_file")" || return 1
@@ -194,7 +263,7 @@ process_file_cached() {
     return 1
   fi
   
-  # 步骤4: 清理缓存
+  # 步骤4: 立即清理缓存（减少磁盘占用）
   safe_cleanup "$cache_input"
   return 0
 }
@@ -453,9 +522,21 @@ initialize_environment() {
     exit 1
   fi
   
+  # 磁盘空间检查
+  log "检查磁盘空间..."
+  check_disk_space "/tmp" "$MIN_FREE_SPACE_MB" || exit 1
+  check_disk_space "$OUTPUT_DIR" "$MIN_FREE_SPACE_MB" || exit 1
+  
+  # 清理过期的临时文件
+  cleanup_temp_files "/tmp" 60
+  
   # 创建必要的目录
   ensure_directory "$OUTPUT_DIR" || exit 1
   ensure_directory "$LOG_DIR" || exit 1
+  
+  # 设置Parallel临时目录
+  export TMPDIR="$PARALLEL_TMPDIR"
+  export PARALLEL_TMPDIR
   
   # 初始化缓存（如果启用）
   if [[ "$USE_LOCAL_CACHE" == "true" ]]; then
@@ -467,10 +548,12 @@ initialize_environment() {
     fi
     ensure_directory "$LOCAL_CACHE_DIR/input" || exit 1
     ensure_directory "$LOCAL_CACHE_DIR/output" || exit 1
+    
+    log "缓存配置: 最大文件数=$MAX_CACHE_FILES，最小剩余空间=${MIN_FREE_SPACE_MB}MB"
   fi
 }
 
-# 执行并行处理
+# 执行并行处理（优化缓冲区使用）
 execute_parallel_processing() {
   local -n files_ref=$1
   local file_count=${#files_ref[@]}
@@ -478,7 +561,13 @@ execute_parallel_processing() {
   log "开始使用 $THREADS 个线程进行并行处理..."
   log "可以使用 'tail -f $JOB_LOG' 查看详细任务日志"
   
-  # 执行并行处理
+  # 最终磁盘空间检查
+  if ! check_disk_space "/tmp" 200; then
+    error "磁盘空间不足，无法启动并行处理"
+    return 1
+  fi
+  
+  # 执行并行处理，优化参数减少缓冲区使用
   if printf "%s\0" "${files_ref[@]}" | \
     parallel \
       --null \
@@ -486,11 +575,22 @@ execute_parallel_processing() {
       --eta \
       -j "$THREADS" \
       --joblog "$JOB_LOG" \
+      --line-buffer \
+      --ungroup \
+      --memfree 100M \
       process_file_wrapper {}; then
     log "✅ 所有文件处理完成"
+    
+    # 清理Parallel临时文件
+    cleanup_temp_files "$PARALLEL_TMPDIR" 0
+    
     return 0
   else
     error "部分文件处理失败，请检查日志: $JOB_LOG"
+    
+    # 清理失败后的临时文件
+    cleanup_temp_files "$PARALLEL_TMPDIR" 0
+    
     return 1
   fi
 }
@@ -543,8 +643,9 @@ main() {
 export -f process_file_wrapper process_file_cached process_file_direct
 export -f get_output_path atomic_move execute_vips_conversion
 export -f ensure_directory safe_cleanup should_process_file
-export -f log error debug get_base_name
+export -f log error debug get_base_name check_disk_space manage_cache_size
 export INPUT_DIR OUTPUT_DIR LOCAL_CACHE_DIR USE_LOCAL_CACHE LOG_LEVEL VIPS_ARGS
+export MIN_FREE_SPACE_MB MAX_CACHE_FILES PARALLEL_TMPDIR
 
 # 脚本入口
 main "$@"
