@@ -14,18 +14,21 @@ readonly OUTPUT_DIR="/app/output"
 readonly THREADS=${THREADS:-4}
 readonly LOG_LEVEL=${LOG_LEVEL:-INFO}
 
-# 缓存配置
-readonly USE_LOCAL_CACHE=${USE_LOCAL_CACHE:-true}
-readonly LOCAL_CACHE_DIR="/tmp/cache"
-
-# 日志配置
-readonly LOG_DIR="/tmp/logs"
-readonly JOB_LOG="$LOG_DIR/tiff_conversion.log"
+# 缓存配置 - 支持自定义目录避免/tmp空间不足
+USE_LOCAL_CACHE=${USE_LOCAL_CACHE:-false}      # 默认禁用本地缓存（动态可修改）
+readonly DEFAULT_CACHE_DIR=${CACHE_BASE_DIR:-/app/cache}   # 默认缓存基础目录
+readonly DEFAULT_LOG_DIR=${LOG_BASE_DIR:-/app/logs}        # 默认日志基础目录
 
 # 磁盘空间配置
-readonly MIN_FREE_SPACE_MB=${MIN_FREE_SPACE_MB:-1024}  # 最小剩余空间1GB
-readonly PARALLEL_TMPDIR=${PARALLEL_TMPDIR:-/tmp}      # Parallel临时目录
-readonly MAX_CACHE_FILES=${MAX_CACHE_FILES:-50}        # 最大同时缓存文件数
+readonly MIN_FREE_SPACE_MB=${MIN_FREE_SPACE_MB:-500}    # 降低最小空间要求到500MB
+readonly MAX_CACHE_FILES=${MAX_CACHE_FILES:-20}         # 减少最大同时缓存文件数
+
+# 运行时动态设置的目录变量（初始化时确定）
+ACTIVE_CACHE_DIR=""
+ACTIVE_LOG_DIR=""
+ACTIVE_PARALLEL_DIR=""
+LOCAL_CACHE_DIR=""
+JOB_LOG=""
 
 # 处理配置
 readonly VIPS_ARGS="--compression=deflate --tile --tile-width=256 --tile-height=256 --pyramid"
@@ -88,16 +91,49 @@ check_disk_space() {
   local dir="$1"
   local min_mb="${2:-$MIN_FREE_SPACE_MB}"
   
+  # 确保目录存在
+  [[ ! -d "$dir" ]] && mkdir -p "$dir" 2>/dev/null
+  
   # 获取可用空间（MB）
   local available_mb
   available_mb=$(df "$dir" 2>/dev/null | awk 'NR==2 {printf "%.0f", $4/1024}')
   
   if [[ -z "$available_mb" || "$available_mb" -lt "$min_mb" ]]; then
-    error "磁盘空间不足: $dir 仅剩 ${available_mb}MB，需要至少 ${min_mb}MB"
+    error "磁盘空间不足: $dir 仅剩 ${available_mb:-0}MB，需要至少 ${min_mb}MB"
     return 1
   fi
   
   log "磁盘空间检查: $dir 可用 ${available_mb}MB"
+  return 0
+}
+
+# 选择最佳的工作目录
+select_best_work_dir() {
+  local min_space="$1"
+  local candidate_dirs=("/app/cache" "/app/tmp" "/tmp" "/var/tmp")
+  
+  for dir in "${candidate_dirs[@]}"; do
+    if mkdir -p "$dir" 2>/dev/null && check_disk_space "$dir" "$min_space" 2>/dev/null; then
+      log "选择工作目录: $dir"
+      echo "$dir"
+      return 0
+    fi
+  done
+  
+  error "无法找到具有足够空间(${min_space}MB)的工作目录"
+  return 1
+}
+
+# 应急处理：直接模式处理（无缓存）
+emergency_direct_mode() {
+  log "⚠️ 启用应急直接模式：禁用所有缓存功能"
+  
+  # 强制设置为直接模式
+  USE_LOCAL_CACHE=false
+  
+  # 使用最小的Parallel配置
+  export PARALLEL="--ungroup --memfree 50M"
+  
   return 0
 }
 
@@ -522,35 +558,80 @@ initialize_environment() {
     exit 1
   fi
   
-  # 磁盘空间检查
-  log "检查磁盘空间..."
-  check_disk_space "/tmp" "$MIN_FREE_SPACE_MB" || exit 1
-  # check_disk_space "$OUTPUT_DIR" "$MIN_FREE_SPACE_MB" || exit 1
-  
-  # 清理过期的临时文件
-  cleanup_temp_files "/tmp" 60
+  # 设置日志目录
+  ACTIVE_LOG_DIR="$DEFAULT_LOG_DIR"
+  JOB_LOG="$ACTIVE_LOG_DIR/tiff_conversion.log"
   
   # 创建必要的目录
   ensure_directory "$OUTPUT_DIR" || exit 1
-  ensure_directory "$LOG_DIR" || exit 1
+  ensure_directory "$ACTIVE_LOG_DIR" || exit 1
   
-  # 设置Parallel临时目录
-  export TMPDIR="$PARALLEL_TMPDIR"
-  export PARALLEL_TMPDIR
+  # 智能磁盘空间管理
+  log "检查磁盘空间..."
   
-  # 初始化缓存（如果启用）
-  if [[ "$USE_LOCAL_CACHE" == "true" ]]; then
-    log "启用本地缓存模式，缓存目录: $LOCAL_CACHE_DIR"
-    
-    # 清理并创建缓存目录
-    if [[ -d "$LOCAL_CACHE_DIR" ]]; then
-      find "$LOCAL_CACHE_DIR" -mindepth 1 -delete 2>/dev/null || true
-    fi
-    ensure_directory "$LOCAL_CACHE_DIR/input" || exit 1
-    ensure_directory "$LOCAL_CACHE_DIR/output" || exit 1
-    
-    log "缓存配置: 最大文件数=$MAX_CACHE_FILES，最小剩余空间=${MIN_FREE_SPACE_MB}MB"
+  # 检查输出目录空间
+  if ! check_disk_space "$OUTPUT_DIR" 100; then
+    error "输出目录空间不足"
+    exit 1
   fi
+  
+  # 选择最佳工作目录
+  local work_dir
+  if work_dir=$(select_best_work_dir "$MIN_FREE_SPACE_MB"); then
+    # 设置相关目录配置
+    ACTIVE_CACHE_DIR="$work_dir"
+    LOCAL_CACHE_DIR="$work_dir/processing"
+    ACTIVE_PARALLEL_DIR="$work_dir/parallel"
+    
+    # 设置环境变量
+    export TMPDIR="$ACTIVE_PARALLEL_DIR"
+    export PARALLEL_TMPDIR="$ACTIVE_PARALLEL_DIR"
+    
+    log "工作目录设置完成: $work_dir"
+  else
+    log "⚠️ 无法找到足够空间的目录，启用应急模式"
+    emergency_direct_mode
+    
+    # 尝试使用输出目录作为临时目录
+    ACTIVE_CACHE_DIR="$OUTPUT_DIR/.cache"
+    ACTIVE_PARALLEL_DIR="$OUTPUT_DIR/.tmp"
+    LOCAL_CACHE_DIR="$ACTIVE_CACHE_DIR/processing"
+    
+    ensure_directory "$ACTIVE_PARALLEL_DIR" || exit 1
+    export TMPDIR="$ACTIVE_PARALLEL_DIR"
+    export PARALLEL_TMPDIR="$ACTIVE_PARALLEL_DIR"
+  fi
+  
+  # 清理过期的临时文件
+  cleanup_temp_files "$ACTIVE_PARALLEL_DIR" 60
+  cleanup_temp_files "/tmp" 30  # 也清理系统/tmp
+  
+  # 初始化缓存（如果启用且有空间）
+  if [[ "$USE_LOCAL_CACHE" == "true" ]]; then
+    if check_disk_space "$ACTIVE_CACHE_DIR" 200; then
+      log "启用本地缓存模式，缓存目录: $LOCAL_CACHE_DIR"
+      
+      # 清理并创建缓存目录
+      if [[ -d "$LOCAL_CACHE_DIR" ]]; then
+        find "$LOCAL_CACHE_DIR" -mindepth 1 -delete 2>/dev/null || true
+      fi
+      ensure_directory "$LOCAL_CACHE_DIR/input" || {
+        log "⚠️ 无法创建缓存目录，切换到直接模式"
+        USE_LOCAL_CACHE=false
+      }
+      ensure_directory "$LOCAL_CACHE_DIR/output" || {
+        log "⚠️ 无法创建缓存目录，切换到直接模式"
+        USE_LOCAL_CACHE=false
+      }
+      
+      [[ "$USE_LOCAL_CACHE" == "true" ]] && log "缓存配置: 最大文件数=$MAX_CACHE_FILES，最小剩余空间=${MIN_FREE_SPACE_MB}MB"
+    else
+      log "⚠️ 缓存目录空间不足，切换到直接模式"
+      USE_LOCAL_CACHE=false
+    fi
+  fi
+  
+  [[ "$USE_LOCAL_CACHE" == "false" ]] && log "使用直接处理模式（无缓存）"
 }
 
 # 执行并行处理（优化缓冲区使用）
@@ -562,9 +643,14 @@ execute_parallel_processing() {
   log "可以使用 'tail -f $JOB_LOG' 查看详细任务日志"
   
   # 最终磁盘空间检查
-  if ! check_disk_space "/tmp" 200; then
-    error "磁盘空间不足，无法启动并行处理"
-    return 1
+  if ! check_disk_space "$ACTIVE_PARALLEL_DIR" 100; then
+    log "⚠️ 临时目录空间不足，尝试清理后继续..."
+    cleanup_temp_files "$ACTIVE_PARALLEL_DIR" 0
+    
+    if ! check_disk_space "$ACTIVE_PARALLEL_DIR" 50; then
+      error "磁盘空间严重不足，无法启动并行处理"
+      return 1
+    fi
   fi
   
   # 执行并行处理，优化参数减少缓冲区使用
@@ -581,14 +667,14 @@ execute_parallel_processing() {
     log "✅ 所有文件处理完成"
     
     # 清理Parallel临时文件
-    cleanup_temp_files "$PARALLEL_TMPDIR" 0
+    cleanup_temp_files "$ACTIVE_PARALLEL_DIR" 0
     
     return 0
   else
     error "部分文件处理失败，请检查日志: $JOB_LOG"
     
     # 清理失败后的临时文件
-    cleanup_temp_files "$PARALLEL_TMPDIR" 0
+    cleanup_temp_files "$ACTIVE_PARALLEL_DIR" 0
     
     return 1
   fi
@@ -644,7 +730,7 @@ export -f get_output_path atomic_move execute_vips_conversion
 export -f ensure_directory safe_cleanup should_process_file
 export -f log error debug get_base_name check_disk_space manage_cache_size
 export INPUT_DIR OUTPUT_DIR LOCAL_CACHE_DIR USE_LOCAL_CACHE LOG_LEVEL VIPS_ARGS
-export MIN_FREE_SPACE_MB MAX_CACHE_FILES PARALLEL_TMPDIR
+export MIN_FREE_SPACE_MB MAX_CACHE_FILES
 
 # 脚本入口
 main "$@"
