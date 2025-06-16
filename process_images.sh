@@ -39,11 +39,29 @@ log() {
 # 输出: 对应的输出文件路径
 get_output_path() {
   local input_file="$1"
+  
+  # 检查输入参数
+  if [[ -z "$input_file" ]]; then
+    echo "错误: get_output_path 缺少输入文件参数" >&2
+    return 1
+  fi
+  
   local filename
   filename=$(basename "$input_file")
+  
+  # 计算相对路径，处理根目录情况
+  local relative_path="${input_file#$INPUT_DIR}"
+  # 移除开头的斜杠（如果存在）
+  relative_path="${relative_path#/}"
   local relative_dir
-  relative_dir=$(dirname "${input_file#$INPUT_DIR/}")
-  echo "$OUTPUT_DIR/$relative_dir/${filename%.*}.tif"
+  relative_dir=$(dirname "$relative_path")
+  
+  # 如果是根目录，relative_dir 为 "."
+  if [[ "$relative_dir" == "." ]]; then
+    echo "$OUTPUT_DIR/${filename%.*}.tif"
+  else
+    echo "$OUTPUT_DIR/$relative_dir/${filename%.*}.tif"
+  fi
 }
 
 # 原子文件操作：安全地移动文件
@@ -172,6 +190,8 @@ export INPUT_DIR OUTPUT_DIR LOCAL_CACHE_DIR USE_LOCAL_CACHE
 
 # 主函数：脚本的入口点
 main() {
+  # 显示 LOG_LEVEL
+  log "当前日志级别: ${LOG_LEVEL:-INFO}"
   # 验证输入目录
   if [[ ! -d "$INPUT_DIR" ]]; then
     log "错误: 输入目录不存在: $INPUT_DIR"
@@ -196,7 +216,7 @@ main() {
   # 查找所有 TIFF 文件，使用 NULL 分隔符处理特殊文件名
   local all_files=()
   mapfile -d '' all_files < <(find "$INPUT_DIR" -type f \( -iname "*.tif" -o -iname "*.tiff" \) -print0)
-  
+  log "找到 ${#all_files[@]} 个 TIFF 文件"
   local total_files=${#all_files[@]}
   
   # 检查是否找到文件
@@ -205,7 +225,81 @@ main() {
     exit 0
   fi
   
-  log "找到 $total_files 个文件待处理（已转换文件将在处理时跳过）"
+  # 统计已完成的文件数量
+  log "正在统计已完成的文件..."
+  
+  # 安全初始化变量
+  local completed_count=0
+  local pending_files=()
+  local processed_count=0
+  
+  # 添加错误捕获
+  set +e  # 暂时关闭严格错误模式
+  
+  log "开始检查 $total_files 个文件..."
+  
+  for input_file in "${all_files[@]}"; do
+    # 安全递增计数器
+    processed_count=$((processed_count + 1))
+    
+    # 每处理100个文件显示一次进度
+    if [[ $((processed_count % 100)) -eq 0 ]] || [[ "${LOG_LEVEL:-INFO}" == "DEBUG" ]]; then
+      log "已检查 $processed_count/$total_files 个文件..."
+    fi
+    
+    # 调试：显示正在处理的文件
+    if [[ "${LOG_LEVEL:-INFO}" == "DEBUG" ]]; then
+      log "检查文件: $input_file"
+    fi
+    
+    # 获取输出路径
+    local output_file=""
+    output_file=$(get_output_path "$input_file" 2>&1)
+    local get_path_result=$?
+    
+    if [[ $get_path_result -ne 0 ]]; then
+      log "警告: 无法获取输出路径: $input_file，错误: $output_file"
+      continue
+    fi
+    
+    if [[ "${LOG_LEVEL:-INFO}" == "DEBUG" ]]; then
+      log "对应输出: $output_file"
+    fi
+    
+    # 检查文件是否存在
+    if [[ -f "$output_file" ]]; then
+      completed_count=$((completed_count + 1))
+      if [[ "${LOG_LEVEL:-INFO}" == "DEBUG" ]]; then
+        log "已完成: $output_file"
+      fi
+    else
+      pending_files+=("$input_file")
+      if [[ "${LOG_LEVEL:-INFO}" == "DEBUG" ]]; then
+        log "待处理: $input_file"
+      fi
+    fi
+  done
+  
+  # 重新启用严格错误模式
+  set -e
+  
+  log "文件检查完成，共检查了 $processed_count 个文件"
+  
+  local pending_count=${#pending_files[@]}
+  
+  # 输出统计信息
+  log "文件统计：总计 $total_files 个文件"
+  log "  ✅ 已完成：$completed_count 个文件"
+  log "  ⏳ 待处理：$pending_count 个文件"
+  
+  # 如果没有待处理文件，直接完成
+  if [[ "$pending_count" -eq 0 ]]; then
+    log "✅ 所有文件已完成转换，无需处理。"
+    exit 0
+  fi
+  
+  # 更新处理文件列表为待处理文件
+  all_files=("${pending_files[@]}")
   log "开始使用 $THREADS 个线程进行并行处理..."
   log "可以使用 'tail -f /tmp/logs/tiff_conversion.log' 查看详细任务日志"
   
