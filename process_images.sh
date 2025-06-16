@@ -293,45 +293,152 @@ scan_completed_files() {
   fi
 }
 
-# 分析文件状态
+# 内联版本的get_base_name，避免函数调用开销
+get_base_name_inline() {
+  local file_path="$1"
+  local base_dir="$2"
+  
+  # 标准化基础目录路径
+  local normalized_base="${base_dir%/}/"
+  
+  # 移除基础目录前缀
+  local relative_path="${file_path#$normalized_base}"
+  
+  # 如果移除失败，使用文件名
+  if [[ "$relative_path" == "$file_path" ]]; then
+    relative_path="${file_path##*/}"  # 更快的basename
+  fi
+  
+  # 移除文件扩展名并直接返回
+  echo "${relative_path%.*}"
+}
+
+# 高性能的文件状态分析函数
 analyze_file_status() {
   local -n all_files_ref=$1
   local -n processed_files_ref=$2
   local -n pending_files_ref=$3
   local -n completed_count_ref=$4
   
-  local processed_count=0
   local total_files=${#all_files_ref[@]}
+  local normalized_input_dir="${INPUT_DIR%/}/"
+  local is_debug=false
+  
+  # 预先判断是否为DEBUG模式，避免重复检查
+  [[ "${LOG_LEVEL}" == "DEBUG" ]] && is_debug=true
   
   log "开始检查 $total_files 个输入文件..."
+  
+  # 使用本地数组收集待处理文件，避免频繁扩展
+  local pending_temp=()
+  local processed_count=0
+  local next_progress_report=$PROGRESS_INTERVAL
   
   for input_file in "${all_files_ref[@]}"; do
     ((processed_count++))
     
-    # 显示进度
-    if [[ $((processed_count % PROGRESS_INTERVAL)) -eq 0 ]] || [[ "${LOG_LEVEL}" == "DEBUG" ]]; then
+    # 优化进度报告：使用预计算阈值
+    if [[ $processed_count -eq $next_progress_report ]]; then
       log "已检查 $processed_count/$total_files 个文件..."
+      next_progress_report=$((processed_count + PROGRESS_INTERVAL))
     fi
     
-    # 获取基础名称用于匹配
-    local input_base
-    input_base=$(get_base_name "$input_file" "$INPUT_DIR")
+    # 高效的内联路径处理
+    local relative_path="${input_file#$normalized_input_dir}"
+    [[ "$relative_path" == "$input_file" ]] && relative_path="${input_file##*/}"
+    local input_base="${relative_path%.*}"
     
-    debug "输入映射: $input_file -> $input_base"
-    
-    debug "检查文件: $input_file -> $input_base"
+    # 条件调试输出
+    $is_debug && debug "输入映射: $input_file -> $input_base"
     
     # 检查是否已完成
     if [[ ${processed_files_ref["$input_base"]:-} ]]; then
       ((completed_count_ref++))
-      debug "✅ 匹配成功: $input_base"
+      $is_debug && debug "✅ 匹配成功: $input_base"
     else
-      pending_files_ref+=("$input_file")
-      debug "❌ 未找到匹配: $input_base"
+      pending_temp+=("$input_file")
+      $is_debug && debug "❌ 未找到匹配: $input_base"
     fi
   done
   
+  # 批量复制到目标数组
+  pending_files_ref=("${pending_temp[@]}")
+  
   log "文件检查完成，共检查了 $processed_count 个文件"
+}
+
+# 为大文件集合提供的并行版本（实验性）
+analyze_file_status_parallel() {
+  local -n all_files_ref=$1
+  local -n processed_files_ref=$2
+  local -n pending_files_ref=$3
+  local -n completed_count_ref=$4
+  
+  local total_files=${#all_files_ref[@]}
+  
+  # 仅在文件数量大于阈值时使用并行处理
+  if [[ $total_files -lt 1000 ]]; then
+    analyze_file_status "$@"
+    return
+  fi
+  
+  log "文件数量较大($total_files)，使用并行分析..."
+  
+  # 创建临时文件存储结果
+  local temp_dir="/tmp/analyze_$$"
+  mkdir -p "$temp_dir"
+  
+  # 分块处理
+  local chunk_size=100
+  local chunk_count=0
+  local normalized_input_dir="${INPUT_DIR%/}/"
+  
+  # 导出必要的变量和函数
+  export INPUT_DIR OUTPUT_DIR normalized_input_dir
+  export -A processed_files_ref
+  
+  # 使用xargs进行并行处理
+  printf '%s\n' "${all_files_ref[@]}" | \
+  xargs -n $chunk_size -P "$THREADS" -I {} bash -c '
+    completed=0
+    pending_file="'$temp_dir'/pending.$$.txt"
+    for file in "$@"; do
+      relative="${file#'$normalized_input_dir'}"
+      [[ "$relative" == "$file" ]] && relative="${file##*/}"
+      base="${relative%.*}"
+      if [[ ${processed_files_ref["$base"]:-} ]]; then
+        ((completed++))
+      else
+        echo "$file" >> "$pending_file"
+      fi
+    done
+    echo "$completed" > "'$temp_dir'/completed.$$.txt"
+  ' _ {}
+  
+  # 收集结果
+  local pending_temp=()
+  completed_count_ref=0
+  
+  for completed_file in "$temp_dir"/completed.*.txt; do
+    [[ -f "$completed_file" ]] || continue
+    local count
+    count=$(cat "$completed_file")
+    completed_count_ref=$((completed_count_ref + count))
+  done
+  
+  for pending_file in "$temp_dir"/pending.*.txt; do
+    [[ -f "$pending_file" ]] || continue
+    while IFS= read -r file; do
+      pending_temp+=("$file")
+    done < "$pending_file"
+  done
+  
+  pending_files_ref=("${pending_temp[@]}")
+  
+  # 清理临时文件
+  rm -rf "$temp_dir"
+  
+  log "并行分析完成，共检查了 $total_files 个文件"
 }
 
 # ============================== 主要流程函数 ==============================
