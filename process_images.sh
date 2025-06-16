@@ -525,7 +525,7 @@ initialize_environment() {
   # 磁盘空间检查
   log "检查磁盘空间..."
   check_disk_space "/tmp" "$MIN_FREE_SPACE_MB" || exit 1
-  check_disk_space "$OUTPUT_DIR" "$MIN_FREE_SPACE_MB" || exit 1
+  # check_disk_space "$OUTPUT_DIR" "$MIN_FREE_SPACE_MB" || exit 1
   
   # 清理过期的临时文件
   cleanup_temp_files "/tmp" 60
