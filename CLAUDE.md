@@ -91,3 +91,104 @@ vips im_vips2tiff input.tif output.tif:deflate,tile:256x256,pyramid
 - 内存高效的文件处理
 - 进度条和ETA显示
 - 跳过已处理的文件避免重复工作
+
+## 项目文件结构
+
+### 核心文件
+- `dockerfile`: Alpine Linux 3.22 基础镜像，固定版本 libvips 8.16.1、vips-tools、parallel 等
+- `docker-compose.yaml`: 服务配置，包含资源限制、安全配置和健康检查
+- `process_images.sh`: 主处理脚本，支持缓存模式和直接模式，包含严格错误处理
+- `prd.md`: 完整的产品需求文档，包含技术规格和业务需求
+
+### 目录结构
+- `input/`: 输入 TIFF 文件目录（通过卷挂载，只读）
+- `output/`: 转换后的输出文件目录
+- `logs/`: 处理日志文件目录
+
+## 重要配置更新
+
+### 实际环境变量配置
+基于当前 docker-compose.yaml 的实际配置：
+
+**目录挂载配置**:
+- `INPUT_FOLDER`: 输入目录路径（默认: ./input）
+- `OUTPUT_FOLDER`: 输出目录路径（默认: ./output）
+- `LOG_FOLDER`: 日志目录路径（默认: ./logs）
+
+**处理配置**:
+- `THREADS`: 处理线程数（默认: 4）
+- `USE_LOCAL_CACHE`: 启用本地缓存模式（默认: true）
+- `LOG_LEVEL`: 日志级别（默认: INFO）
+- `TZ`: 时区设置（默认: UTC）
+
+**资源限制配置**:
+- `MEMORY_LIMIT`: 内存限制（默认: 2G）
+- `CPU_LIMIT`: CPU 限制（默认: 6.0）
+
+**配置文件**: 
+所有环境变量都可以在 `.env.example` 文件中找到完整说明和配置示例。
+
+### 处理模式选择
+脚本支持两种处理模式，通过 `USE_LOCAL_CACHE` 环境变量控制：
+
+1. **本地缓存模式** (`USE_LOCAL_CACHE=true`): 
+   - 适用于 NFS 环境优化
+   - 先复制到本地缓存 `/tmp/cache` 处理，再复制回 NFS
+   - 减少网络 I/O，提高性能
+
+2. **直接模式** (`USE_LOCAL_CACHE=false`):
+   - 适用于本地存储环境
+   - 直接在目标位置处理文件
+   - 节省磁盘空间和复制时间
+
+## 脚本核心特性
+
+### 错误处理机制
+- 使用 `set -Eeuo pipefail` 严格错误处理
+- 原子文件操作，使用临时文件确保数据完整性
+- 失败时自动清理不完整的文件
+- 支持断点续传，跳过已存在的输出文件
+
+### 安全配置
+- 容器以非 root 用户 `vipsuser` 运行
+- 使用 `no-new-privileges:true` 安全选项
+- tmpfs 挂载 `/tmp` 目录，防止敏感数据泄露
+- 资源限制防止系统过载
+
+## 调试和故障排除
+
+### 常用调试命令
+```bash
+# 查看容器状态
+docker-compose ps
+
+# 查看实时日志
+docker-compose logs -f
+
+# 进入容器调试
+docker exec -it libvips-processor /bin/bash
+
+# 查看详细处理日志
+docker exec -it libvips-processor tail -f /tmp/logs/tiff_conversion.log
+
+# 检查处理进度
+docker exec -it libvips-processor ps aux | grep parallel
+```
+
+### 性能调优
+```bash
+# 根据 CPU 核数调整线程
+THREADS=$(nproc) docker-compose up
+
+# 大内存环境优化
+MEMORY_LIMIT=8G THREADS=16 docker-compose up
+
+# NFS 环境优化（启用缓存）
+USE_LOCAL_CACHE=true docker-compose up
+```
+
+# important-instruction-reminders
+Do what has been asked; nothing more, nothing less.
+NEVER create files unless they're absolutely necessary for achieving your goal.
+ALWAYS prefer editing an existing file to creating a new one.
+NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.

@@ -14,13 +14,14 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TZ=${TZ:-UTC}
       - USE_LOCAL_CACHE=${USE_LOCAL_CACHE:-true}
+      - CPU_LIMIT=${CPU_LIMIT:-6.0}
     
-    # 资源限制（CPU 限制基于线程数）
+    # 资源限制（CPU 限制适度高于线程数以避免资源竞争）
     deploy:
       resources:
         limits:
           memory: ${MEMORY_LIMIT:-2G}
-          cpus: '${THREADS:-4}.0'
+          cpus: '${CPU_LIMIT}'
         reservations:
           memory: 512M
           cpus: '1.0'
@@ -29,4 +30,4 @@ services:
     security_opt:
       - no-new-privileges:true
     tmpfs:
-      - /tmp:noexec,nosuid,size=100m
+      - /tmp:noexec,nosuid,size=2g

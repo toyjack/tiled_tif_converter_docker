@@ -100,7 +100,7 @@ process_single_file_cached() {
   fi
   
   # 步骤2: 在本地执行图像转换
-  if ! vips im_vips2tiff "$cache_input" "$cache_output:deflate,tile:256x256,pyramid" >/dev/null 2>&1; then
+  if ! vips tiffsave "$cache_input" "$cache_output" --compression=deflate --tile --tile-width=256 --tile-height=256 --pyramid >/dev/null 2>&1; then
     log "✗ 图像转换失败: $input_file"
     cleanup_on_error "$cache_input" "$cache_output"
     return 1
@@ -138,7 +138,7 @@ process_single_file_direct() {
   local temp_file="$output_file.tmp.$$"
   
   # 执行图像转换到临时文件
-  if vips im_vips2tiff "$input_file" "$temp_file:deflate,tile:256x256,pyramid" >/dev/null 2>&1; then
+  if vips tiffsave "$input_file" "$temp_file" --compression=deflate --tile --tile-width=256 --tile-height=256 --pyramid >/dev/null 2>&1; then
     # 原子移动到最终位置
     if mv "$temp_file" "$output_file" 2>/dev/null; then
       return 0
@@ -207,7 +207,7 @@ main() {
   
   log "找到 $total_files 个文件待处理（已转换文件将在处理时跳过）"
   log "开始使用 $THREADS 个线程进行并行处理..."
-  log "可以使用 'tail -f /tmp/tiff_conversion.log' 查看详细任务日志"
+  log "可以使用 'tail -f /tmp/logs/tiff_conversion.log' 查看详细任务日志"
   
   # 使用 GNU Parallel 进行并行处理
   # --null: 输入使用 NULL 分隔符
@@ -215,6 +215,7 @@ main() {
   # --eta: 显示预计剩余时间  
   # -j: 并行作业数
   # --joblog: 详细作业日志
+  local parallel_exit_code=0
   if printf "%s\0" "${all_files[@]}" | \
     parallel \
       --null \
@@ -223,10 +224,19 @@ main() {
       -j "$THREADS" \
       --joblog /tmp/logs/tiff_conversion.log \
       process_file_wrapper {}; then
-    log "✅ 所有文件处理完成"
+    parallel_exit_code=0
   else
-    log "⚠️ 部分文件处理失败，请检查日志: /tmp/logs/tiff_conversion.log"
-    exit 1
+    parallel_exit_code=1
+  fi
+  
+  # 确保仅主进程输出完成信息
+  if [[ $$ == $BASHPID ]]; then
+    if [[ $parallel_exit_code -eq 0 ]]; then
+      log "✅ 所有文件处理完成"
+    else
+      log "⚠️ 部分文件处理失败，请检查日志: /tmp/logs/tiff_conversion.log"
+      exit 1
+    fi
   fi
 }
 
