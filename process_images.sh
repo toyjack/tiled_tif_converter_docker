@@ -6,58 +6,117 @@
 # 支持：本地缓存模式（NFS 优化）、并行处理、断点续传
 # =================================================================
 
-# 脚本配置
+# ============================== 配置部分 ==============================
+
+# 基础配置
 readonly INPUT_DIR="/app/input"
 readonly OUTPUT_DIR="/app/output" 
 readonly THREADS=${THREADS:-4}
-readonly LOCAL_CACHE_DIR="/tmp/cache"
-readonly USE_LOCAL_CACHE=${USE_LOCAL_CACHE:-true}
 readonly LOG_LEVEL=${LOG_LEVEL:-INFO}
 
+# 缓存配置
+readonly USE_LOCAL_CACHE=${USE_LOCAL_CACHE:-true}
+readonly LOCAL_CACHE_DIR="/tmp/cache"
+
+# 日志配置
+readonly LOG_DIR="/tmp/logs"
+readonly JOB_LOG="$LOG_DIR/tiff_conversion.log"
+
+# 处理配置
+readonly VIPS_ARGS="--compression=deflate --tile --tile-width=256 --tile-height=256 --pyramid"
+readonly PROGRESS_INTERVAL=100
+
+# ============================== 错误处理 ==============================
+
 # 严格错误处理
-# -E: trap ERR 信号继承到函数和子shell
-# -u: 使用未定义变量时报错
-# -o pipefail: 管道中任一命令失败则整个管道失败
-set -Eeuo pipefail
+# set -Eeuo pipefail
 
-# 设置退出时的清理函数
-trap 'cleanup' EXIT
-
-# 清理函数：清理临时文件和缓存
+# 退出清理函数
 cleanup() {
   if [[ "${USE_LOCAL_CACHE}" == "true" && -d "${LOCAL_CACHE_DIR}" ]]; then
     find "${LOCAL_CACHE_DIR}" -mindepth 1 -delete 2>/dev/null || true
   fi
 }
 
-# 日志函数：输出带时间戳的日志到标准错误
+# 设置退出时的清理函数
+trap 'cleanup' EXIT
+
+# ============================== 工具函数 ==============================
+
+# 日志函数
 log() {
-  echo >&2 "$(date '+%Y-%m-%d %H:%M:%S') - $1"
+  local level="${2:-INFO}"
+  echo >&2 "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $1"
+}
+
+# 调试日志
+debug() {
+  [[ "${LOG_LEVEL}" == "DEBUG" ]] && log "$1" "DEBUG"
+}
+
+# 错误日志
+error() {
+  log "$1" "ERROR"
+}
+
+# 确保目录存在
+ensure_directory() {
+  local dir="$1"
+  if [[ ! -d "$dir" ]]; then
+    mkdir -p "$dir" || {
+      error "无法创建目录: $dir"
+      return 1
+    }
+  fi
+}
+
+# 安全清理文件
+safe_cleanup() {
+  local file
+  for file in "$@"; do
+    [[ -f "$file" ]] && rm -f "$file" 2>/dev/null || true
+  done
+}
+
+# ============================== 路径处理函数 ==============================
+
+# 获取相对路径的基础名称（用于匹配）
+get_base_name() {
+  local file_path="$1"
+  local base_dir="$2"
+  
+  # 标准化基础目录路径
+  local normalized_base="${base_dir%/}/"
+  
+  # 移除基础目录前缀
+  local relative_path="${file_path#$normalized_base}"
+  
+  # 如果移除失败（路径不在基础目录下），使用文件名
+  if [[ "$relative_path" == "$file_path" ]]; then
+    relative_path=$(basename "$file_path")
+  fi
+  
+  # 移除文件扩展名
+  echo "${relative_path%.*}"
 }
 
 # 获取输出文件路径
-# 参数: $1 - 输入文件完整路径
-# 输出: 对应的输出文件路径
 get_output_path() {
   local input_file="$1"
   
-  # 检查输入参数
   if [[ -z "$input_file" ]]; then
-    echo "错误: get_output_path 缺少输入文件参数" >&2
+    error "get_output_path: 缺少输入文件参数"
     return 1
   fi
   
+  # 计算相对路径
+  local relative_path="${input_file#${INPUT_DIR%/}/}"
+  local relative_dir
+  relative_dir=$(dirname "$relative_path")
   local filename
   filename=$(basename "$input_file")
   
-  # 计算相对路径，处理根目录情况
-  local relative_path="${input_file#$INPUT_DIR}"
-  # 移除开头的斜杠（如果存在）
-  relative_path="${relative_path#/}"
-  local relative_dir
-  relative_dir=$(dirname "$relative_path")
-  
-  # 如果是根目录，relative_dir 为 "."
+  # 构建输出路径
   if [[ "$relative_dir" == "." ]]; then
     echo "$OUTPUT_DIR/${filename%.*}.tif"
   else
@@ -65,9 +124,9 @@ get_output_path() {
   fi
 }
 
-# 原子文件操作：安全地移动文件
-# 参数: $1 - 源文件, $2 - 目标文件
-# 返回: 0 成功, 1 失败
+# ============================== 文件操作函数 ==============================
+
+# 原子文件移动
 atomic_move() {
   local source="$1"
   local target="$2"
@@ -76,240 +135,283 @@ atomic_move() {
   if cp "$source" "$temp_file" 2>/dev/null && mv "$temp_file" "$target" 2>/dev/null; then
     return 0
   else
-    rm -f "$temp_file" 2>/dev/null || true
+    safe_cleanup "$temp_file"
     return 1
   fi
 }
 
-# 错误处理：清理失败时的临时文件
-# 参数: 要清理的文件列表
-cleanup_on_error() {
-  local file
-  for file in "$@"; do
-    [[ -f "$file" ]] && rm -f "$file" 2>/dev/null || true
-  done
+# 检查文件是否需要处理
+should_process_file() {
+  local output_file="$1"
+  [[ ! -f "$output_file" ]]
 }
 
-# 本地缓存模式处理单个文件
-# 适用于 NFS 环境，先缓存到本地处理后再传输回去
-# 参数: $1 - 输入文件路径
-process_single_file_cached() {
+# ============================== 图像处理函数 ==============================
+
+# 执行VIPS转换
+execute_vips_conversion() {
+  local input_file="$1"
+  local output_file="$2"
+  
+  vips tiffsave "$input_file" "$output_file" $VIPS_ARGS >/dev/null 2>&1
+}
+
+# 缓存模式处理文件
+process_file_cached() {
   local input_file="$1"
   local output_file
   output_file=$(get_output_path "$input_file")
   
   # 跳过已存在的文件
-  if [[ -f "$output_file" ]]; then
-    return 0
-  fi
+  should_process_file "$output_file" || return 0
   
   # 确保输出目录存在
-  mkdir -p "$(dirname "$output_file")"
+  ensure_directory "$(dirname "$output_file")" || return 1
   
-  # 构建本地缓存路径
+  # 构建缓存路径
   local filename
   filename=$(basename "$input_file")
   local cache_input="$LOCAL_CACHE_DIR/input/$filename"
   local cache_output="$LOCAL_CACHE_DIR/output/${filename%.*}.tif"
   
-  # 步骤1: 复制输入文件到本地缓存
+  # 步骤1: 复制到缓存
   if ! cp "$input_file" "$cache_input" 2>/dev/null; then
-    log "✗ 复制到缓存失败: $input_file"
+    error "复制到缓存失败: $input_file"
     return 1
   fi
   
-  # 步骤2: 在本地执行图像转换
-  if ! vips tiffsave "$cache_input" "$cache_output" --compression=deflate --tile --tile-width=256 --tile-height=256 --pyramid >/dev/null 2>&1; then
-    log "✗ 图像转换失败: $input_file"
-    cleanup_on_error "$cache_input" "$cache_output"
+  # 步骤2: 执行转换
+  if ! execute_vips_conversion "$cache_input" "$cache_output"; then
+    error "图像转换失败: $input_file"
+    safe_cleanup "$cache_input" "$cache_output"
     return 1
   fi
   
-  # 步骤3: 原子操作复制结果回 NFS
+  # 步骤3: 原子移动到最终位置
   if ! atomic_move "$cache_output" "$output_file"; then
-    log "✗ 复制回 NFS 失败: $input_file"
-    cleanup_on_error "$cache_input" "$cache_output" "$output_file"
+    error "复制回目标失败: $input_file"
+    safe_cleanup "$cache_input" "$cache_output"
     return 1
   fi
   
-  # 步骤4: 清理本地缓存
-  cleanup_on_error "$cache_input" "$cache_output"
+  # 步骤4: 清理缓存
+  safe_cleanup "$cache_input"
   return 0
 }
 
-# 直接模式处理单个文件
-# 适用于本地存储，直接在目标位置处理
-# 参数: $1 - 输入文件路径
-process_single_file_direct() {
+# 直接模式处理文件
+process_file_direct() {
   local input_file="$1"
   local output_file
   output_file=$(get_output_path "$input_file")
   
   # 跳过已存在的文件
-  if [[ -f "$output_file" ]]; then
-    return 0
-  fi
+  should_process_file "$output_file" || return 0
   
   # 确保输出目录存在
-  mkdir -p "$(dirname "$output_file")"
+  ensure_directory "$(dirname "$output_file")" || return 1
   
   # 使用临时文件确保原子操作
   local temp_file="$output_file.tmp.$$"
   
-  # 执行图像转换到临时文件
-  if vips tiffsave "$input_file" "$temp_file" --compression=deflate --tile --tile-width=256 --tile-height=256 --pyramid >/dev/null 2>&1; then
-    # 原子移动到最终位置
+  # 执行转换
+  if execute_vips_conversion "$input_file" "$temp_file"; then
+    # 原子移动
     if mv "$temp_file" "$output_file" 2>/dev/null; then
       return 0
     else
-      log "✗ 文件移动失败: $input_file"
-      cleanup_on_error "$temp_file"
+      error "文件移动失败: $input_file"
+      safe_cleanup "$temp_file"
       return 1
     fi
   else
-    log "✗ 图像转换失败: $input_file"
-    cleanup_on_error "$temp_file"
+    error "图像转换失败: $input_file"
+    safe_cleanup "$temp_file"
     return 1
   fi
 }
 
-# 处理模式选择包装器
-# 根据配置自动选择缓存模式或直接模式
-# 参数: $1 - 输入文件路径
+# 处理文件包装器
 process_file_wrapper() {
   if [[ "$USE_LOCAL_CACHE" == "true" ]]; then
-    process_single_file_cached "$@"
+    process_file_cached "$@"
   else
-    process_single_file_direct "$@"
+    process_file_direct "$@"
   fi
 }
 
-# 导出函数和变量供 GNU Parallel 使用
-export -f process_file_wrapper process_single_file_cached process_single_file_direct
-export -f get_output_path atomic_move cleanup_on_error log
-export INPUT_DIR OUTPUT_DIR LOCAL_CACHE_DIR USE_LOCAL_CACHE LOG_LEVEL
+# ============================== 文件发现和状态检查 ==============================
 
-# 主函数：脚本的入口点
-main() {
-  # 显示 LOG_LEVEL
-  log "当前日志级别: ${LOG_LEVEL:-INFO}"
-  # 验证输入目录
-  if [[ ! -d "$INPUT_DIR" ]]; then
-    log "错误: 输入目录不存在: $INPUT_DIR"
-    exit 1
+# 查找所有TIFF文件
+find_tiff_files() {
+  local -n files_ref=$1
+  
+  if ! mapfile -d '' files_ref < <(find "$INPUT_DIR" -type f \( -iname "*.tif" -o -iname "*.tiff" \) -print0 2>/dev/null); then
+    error "查找TIFF文件失败"
+    return 1
   fi
   
-  # 创建输出目录
-  mkdir -p "$OUTPUT_DIR"
+  log "找到 ${#files_ref[@]} 个TIFF文件"
+  return 0
+}
+
+# 扫描已完成的文件
+scan_completed_files() {
+  local -n processed_ref=$1
+  local scan_count=0
   
-  # 初始化本地缓存（如果启用）
-  if [[ "$USE_LOCAL_CACHE" == "true" ]]; then
-    log "启用本地缓存模式，缓存目录: $LOCAL_CACHE_DIR"
-    # 安全清理并创建缓存目录
-    if [[ -d "$LOCAL_CACHE_DIR" ]]; then
-      find "$LOCAL_CACHE_DIR" -mindepth 1 -delete 2>/dev/null || true
-    fi
-    mkdir -p "$LOCAL_CACHE_DIR"/{input,output}
-  fi
-  
-  # 创建日志目录
-  mkdir -p /tmp/logs
-  
-  log "正在查找 TIFF 文件..."
-  
-  # 查找所有 TIFF 文件，使用 NULL 分隔符处理特殊文件名
-  local all_files=()
-  if ! mapfile -d '' all_files < <(find "$INPUT_DIR" -type f \( -iname "*.tif" -o -iname "*.tiff" \) -print0); then
-    log "错误: 查找 TIFF 文件失败"
-    exit 1
-  fi
-  log "找到 ${#all_files[@]} 个 TIFF 文件"
-  local total_files=${#all_files[@]}
-  
-  # 检查是否找到文件
-  if [[ "$total_files" -eq 0 ]]; then
-    log "在 $INPUT_DIR 中未找到 TIFF 文件，任务完成。"
-    exit 0
-  fi
-  
-  # 统计已完成的文件数量
-  log "正在统计已完成的文件..."
-  
-  # 声明关联数组存储已处理的文件
-  declare -A processed_files
-  
-  # 标准化输出目录路径（确保末尾有斜杠）
-  local normalized_output_dir="${OUTPUT_DIR%/}/"
-  
-  # 将输出目录的文件加载到关联数组
   log "正在扫描输出目录..."
-  local output_scan_count=0
   
-  # 使用临时变量避免 pipefail 影响
-  local find_output
-  find_output=$(find "$OUTPUT_DIR" -type f -name "*.tif" -print0 2>/dev/null) || true
+  # 直接使用进程替换扫描输出目录
+  # 使用 || true 确保即使没有找到文件也不会出错
+  while IFS= read -r -d '' output_file; do
+    # 跳过空行
+    [[ -n "$output_file" ]] || continue
+    
+    local base_name
+    base_name=$(get_base_name "$output_file" "$OUTPUT_DIR")
+    processed_ref["$base_name"]=1
+    ((scan_count++))
+    
+    debug "输出映射: $output_file -> $base_name"
+    
+    if [[ $((scan_count % PROGRESS_INTERVAL)) -eq 0 ]]; then
+      log "已扫描输出文件: $scan_count 个..."
+    fi
+    
+    debug "已完成文件: $base_name"
+  done < <(find "$OUTPUT_DIR" -type f -name "*.tif" -print0 2>/dev/null || true)
   
-  if [[ -n "$find_output" ]]; then
-    while IFS= read -r -d '' output_file; do
-      # 正确移除路径前缀
-      local relative_output="${output_file#$normalized_output_dir}"
-      local base_name="${relative_output%.tif}"
-      processed_files["$base_name"]=1
-      ((output_scan_count++))
-      
-      if [[ $((output_scan_count % 100)) -eq 0 ]]; then
-        log "已扫描输出文件: $output_scan_count 个..."
-      fi
-      
-      if [[ "${LOG_LEVEL:-INFO}" == "DEBUG" ]]; then
-        log "已完成文件: $base_name"
-      fi
-    done <<< "$find_output"
+  log "输出目录扫描完成，找到 $scan_count 个已完成文件"
+  
+  # 调试：显示已处理文件列表
+  if [[ "${LOG_LEVEL}" == "DEBUG" && $scan_count -gt 0 ]]; then
+    log "已处理文件键列表："
+    for key in "${!processed_ref[@]}"; do
+      log "  - '$key'"
+    done
   fi
+}
+
+# 分析文件状态
+analyze_file_status() {
+  local -n all_files_ref=$1
+  local -n processed_files_ref=$2
+  local -n pending_files_ref=$3
+  local -n completed_count_ref=$4
   
-  log "输出目录扫描完成，找到 $output_scan_count 个已完成文件"
-  
-  # 标准化输入目录路径（确保末尾有斜杠）
-  local normalized_input_dir="${INPUT_DIR%/}/"
-  
-  # 检查输入文件的处理状态
-  local completed_count=0
-  local pending_files=()
   local processed_count=0
+  local total_files=${#all_files_ref[@]}
   
   log "开始检查 $total_files 个输入文件..."
   
-  for input_file in "${all_files[@]}"; do
-    processed_count=$((processed_count + 1))
+  for input_file in "${all_files_ref[@]}"; do
+    ((processed_count++))
     
-    # 每处理100个文件显示一次进度
-    if [[ $((processed_count % 100)) -eq 0 ]] || [[ "${LOG_LEVEL:-INFO}" == "DEBUG" ]]; then
+    # 显示进度
+    if [[ $((processed_count % PROGRESS_INTERVAL)) -eq 0 ]] || [[ "${LOG_LEVEL}" == "DEBUG" ]]; then
       log "已检查 $processed_count/$total_files 个文件..."
     fi
     
-    # 计算输入文件的相对路径和基础名称
-    local relative_input="${input_file#$normalized_input_dir}"
-    local input_base="${relative_input%.*}"
+    # 获取基础名称用于匹配
+    local input_base
+    input_base=$(get_base_name "$input_file" "$INPUT_DIR")
     
-    if [[ "${LOG_LEVEL:-INFO}" == "DEBUG" ]]; then
-      log "检查文件: $input_file -> $input_base"
-    fi
+    debug "输入映射: $input_file -> $input_base"
     
-    # 使用关联数组快速查找
-    if [[ ${processed_files["$input_base"]:-} ]]; then
-      ((completed_count++))
-      if [[ "${LOG_LEVEL:-INFO}" == "DEBUG" ]]; then
-        log "已完成: $input_base"
-      fi
+    debug "检查文件: $input_file -> $input_base"
+    
+    # 检查是否已完成
+    if [[ ${processed_files_ref["$input_base"]:-} ]]; then
+      ((completed_count_ref++))
+      debug "✅ 匹配成功: $input_base"
     else
-      pending_files+=("$input_file")
-      if [[ "${LOG_LEVEL:-INFO}" == "DEBUG" ]]; then
-        log "待处理: $input_file"
-      fi
+      pending_files_ref+=("$input_file")
+      debug "❌ 未找到匹配: $input_base"
     fi
   done
   
   log "文件检查完成，共检查了 $processed_count 个文件"
+}
+
+# ============================== 主要流程函数 ==============================
+
+# 初始化环境
+initialize_environment() {
+  log "当前日志级别: $LOG_LEVEL"
+  
+  # 验证输入目录
+  if [[ ! -d "$INPUT_DIR" ]]; then
+    error "输入目录不存在: $INPUT_DIR"
+    exit 1
+  fi
+  
+  # 创建必要的目录
+  ensure_directory "$OUTPUT_DIR" || exit 1
+  ensure_directory "$LOG_DIR" || exit 1
+  
+  # 初始化缓存（如果启用）
+  if [[ "$USE_LOCAL_CACHE" == "true" ]]; then
+    log "启用本地缓存模式，缓存目录: $LOCAL_CACHE_DIR"
+    
+    # 清理并创建缓存目录
+    if [[ -d "$LOCAL_CACHE_DIR" ]]; then
+      find "$LOCAL_CACHE_DIR" -mindepth 1 -delete 2>/dev/null || true
+    fi
+    ensure_directory "$LOCAL_CACHE_DIR/input" || exit 1
+    ensure_directory "$LOCAL_CACHE_DIR/output" || exit 1
+  fi
+}
+
+# 执行并行处理
+execute_parallel_processing() {
+  local -n files_ref=$1
+  local file_count=${#files_ref[@]}
+  
+  log "开始使用 $THREADS 个线程进行并行处理..."
+  log "可以使用 'tail -f $JOB_LOG' 查看详细任务日志"
+  
+  # 执行并行处理
+  if printf "%s\0" "${files_ref[@]}" | \
+    parallel \
+      --null \
+      --bar \
+      --eta \
+      -j "$THREADS" \
+      --joblog "$JOB_LOG" \
+      process_file_wrapper {}; then
+    log "✅ 所有文件处理完成"
+    return 0
+  else
+    error "部分文件处理失败，请检查日志: $JOB_LOG"
+    return 1
+  fi
+}
+
+# ============================== 主函数 ==============================
+
+main() {
+  # 初始化环境
+  initialize_environment
+  
+  # 查找所有TIFF文件
+  local all_files=()
+  find_tiff_files all_files || exit 1
+  
+  local total_files=${#all_files[@]}
+  if [[ "$total_files" -eq 0 ]]; then
+    log "在 $INPUT_DIR 中未找到TIFF文件，任务完成。"
+    exit 0
+  fi
+  
+  # 扫描已完成的文件
+  declare -A processed_files
+  scan_completed_files processed_files
+  
+  # 分析文件状态
+  local pending_files=()
+  local completed_count=0
+  analyze_file_status all_files processed_files pending_files completed_count
   
   local pending_count=${#pending_files[@]}
   
@@ -318,37 +420,24 @@ main() {
   log "  ✅ 已完成：$completed_count 个文件"
   log "  ⏳ 待处理：$pending_count 个文件"
   
-  # 如果没有待处理文件，直接完成
+  # 检查是否有待处理文件
   if [[ "$pending_count" -eq 0 ]]; then
     log "✅ 所有文件已完成转换，无需处理。"
     exit 0
   fi
   
-  # 更新处理文件列表为待处理文件
-  all_files=("${pending_files[@]}")
-  log "开始使用 $THREADS 个线程进行并行处理..."
-  log "可以使用 'tail -f /tmp/logs/tiff_conversion.log' 查看详细任务日志"
-  
-  # 使用 GNU Parallel 进行并行处理
-  # --null: 输入使用 NULL 分隔符
-  # --bar: 显示进度条
-  # --eta: 显示预计剩余时间  
-  # -j: 并行作业数
-  # --joblog: 详细作业日志
-  if printf "%s\0" "${all_files[@]}" | \
-    parallel \
-      --null \
-      --bar \
-      --eta \
-      -j "$THREADS" \
-      --joblog /tmp/logs/tiff_conversion.log \
-      process_file_wrapper {}; then
-    log "✅ 所有文件处理完成"
-  else
-    log "⚠️ 部分文件处理失败，请检查日志: /tmp/logs/tiff_conversion.log"
-    exit 1
-  fi
+  # 执行并行处理
+  execute_parallel_processing pending_files || exit 1
 }
 
-# 脚本入口：执行主函数
+# ============================== 导出和入口 ==============================
+
+# 导出函数和变量供GNU Parallel使用
+export -f process_file_wrapper process_file_cached process_file_direct
+export -f get_output_path atomic_move execute_vips_conversion
+export -f ensure_directory safe_cleanup should_process_file
+export -f log error debug get_base_name
+export INPUT_DIR OUTPUT_DIR LOCAL_CACHE_DIR USE_LOCAL_CACHE LOG_LEVEL VIPS_ARGS
+
+# 脚本入口
 main "$@"
