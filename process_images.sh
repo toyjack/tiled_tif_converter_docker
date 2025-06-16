@@ -575,7 +575,6 @@ execute_parallel_processing() {
       --eta \
       -j "$THREADS" \
       --joblog "$JOB_LOG" \
-      --line-buffer \
       --ungroup \
       --memfree 100M \
       process_file_wrapper {}; then
