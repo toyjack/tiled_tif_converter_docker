@@ -2,7 +2,7 @@ services:
   image-processor:
     build: .
     container_name: libvips-processor
-    restart: unless-stopped
+    restart: "no"
     
     volumes:
       - ${INPUT_FOLDER:-./input}:/app/input:ro

@@ -215,7 +215,6 @@ main() {
   # --eta: 显示预计剩余时间  
   # -j: 并行作业数
   # --joblog: 详细作业日志
-  local parallel_exit_code=0
   if printf "%s\0" "${all_files[@]}" | \
     parallel \
       --null \
@@ -224,19 +223,10 @@ main() {
       -j "$THREADS" \
       --joblog /tmp/logs/tiff_conversion.log \
       process_file_wrapper {}; then
-    parallel_exit_code=0
+    log "✅ 所有文件处理完成"
   else
-    parallel_exit_code=1
-  fi
-  
-  # 确保仅主进程输出完成信息
-  if [[ $$ == $BASHPID ]]; then
-    if [[ $parallel_exit_code -eq 0 ]]; then
-      log "✅ 所有文件处理完成"
-    else
-      log "⚠️ 部分文件处理失败，请检查日志: /tmp/logs/tiff_conversion.log"
-      exit 1
-    fi
+    log "⚠️ 部分文件处理失败，请检查日志: /tmp/logs/tiff_conversion.log"
+    exit 1
   fi
 }
 
