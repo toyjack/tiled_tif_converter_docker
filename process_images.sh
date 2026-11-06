@@ -12,7 +12,9 @@
 readonly INPUT_DIR="/app/input"
 readonly OUTPUT_DIR="/app/output" 
 readonly THREADS=${THREADS:-4}
+readonly VIPS_CONCURRENCY=${VIPS_CONCURRENCY:-1}
 readonly LOG_LEVEL=${LOG_LEVEL:-INFO}
+readonly PROGRESS_LOG_INTERVAL=${PROGRESS_LOG_INTERVAL:-30}
 
 # 缓存配置 - 支持自定义目录避免/tmp空间不足
 USE_LOCAL_CACHE=${USE_LOCAL_CACHE:-false}      # 默认禁用本地缓存（动态可修改）
@@ -29,11 +31,13 @@ ACTIVE_LOG_DIR=""
 ACTIVE_PARALLEL_DIR=""
 LOCAL_CACHE_DIR=""
 JOB_LOG=""
+PROGRESS_PID=""
 
 # 处理配置
 readonly VIPS_ARGS="--compression=deflate --tile --tile-width=256 --tile-height=256 --pyramid"
 readonly PROGRESS_INTERVAL=1000
 readonly SCAN_PROGRESS_SECONDS=5
+readonly PARALLEL_MIN_FREE_MEMORY_MIB=100
 
 # ============================== 错误处理 ==============================
 
@@ -42,6 +46,7 @@ readonly SCAN_PROGRESS_SECONDS=5
 
 # 退出清理函数
 cleanup() {
+  stop_progress_monitor
   if [[ "${USE_LOCAL_CACHE}" == "true" && -d "${LOCAL_CACHE_DIR}" ]]; then
     find "${LOCAL_CACHE_DIR}" -mindepth 1 -delete 2>/dev/null || true
   fi
@@ -66,6 +71,42 @@ debug() {
 # 错误日志
 error() {
   log "$1" "ERROR"
+}
+
+# Keep non-interactive batches visible even before the first worker finishes.
+report_parallel_progress() {
+  trap - EXIT
+  local total_files="$1"
+  local started="$2"
+  local sleep_pid=""
+  local counts finished succeeded failed
+
+  # Stop the timer as well so it cannot keep Docker's log pipe open on exit.
+  trap 'kill "$sleep_pid" 2>/dev/null || true; wait "$sleep_pid" 2>/dev/null || true; exit 0' TERM INT
+
+  while true; do
+    sleep "$PROGRESS_LOG_INTERVAL" &
+    sleep_pid=$!
+    wait "$sleep_pid" || return 0
+    sleep_pid=""
+    counts=$(awk -F '\t' '
+      NR > 1 && NF >= 9 {
+        finished++
+        if ($7 == 0 && $8 == 0) succeeded++; else failed++
+      }
+      END { printf "%d %d %d", finished, succeeded, failed }
+    ' "$JOB_LOG" 2>/dev/null)
+    read -r finished succeeded failed <<<"${counts:-0 0 0}"
+    log "批次进度: 已结束 $finished/$total_files，成功 $succeeded，失败 $failed，耗时 $((SECONDS - started)) 秒（未结束任务仍可能在处理或等待调度）"
+  done
+}
+
+stop_progress_monitor() {
+  if [[ -n "$PROGRESS_PID" ]]; then
+    kill "$PROGRESS_PID" 2>/dev/null || true
+    wait "$PROGRESS_PID" 2>/dev/null || true
+    PROGRESS_PID=""
+  fi
 }
 
 # 确保目录存在
@@ -107,6 +148,42 @@ check_disk_space() {
   
   if [[ "$success_level" != "DEBUG" || "$LOG_LEVEL" == "DEBUG" ]]; then
     log "磁盘空间检查: $dir 可用 ${available_mb}MB" "$success_level"
+  fi
+  return 0
+}
+
+# Match GNU Parallel's Linux --memfree calculation, not cgroup headroom.
+check_parallel_memory() {
+  local available_kib
+  available_kib=$(awk '
+    /^((Swap)?Cached|MemFree|Buffers):/ { available += $2; fields++ }
+    END { if (fields) printf "%.0f", available; else exit 1 }
+  ' /proc/meminfo 2>/dev/null) || {
+    error "无法读取 GNU Parallel 可用内存: /proc/meminfo"
+    return 1
+  }
+  if [[ ! "$available_kib" =~ ^[0-9]+$ ]]; then
+    error "GNU Parallel 可用内存检查返回无效值: $available_kib"
+    return 1
+  fi
+
+  log "内存检查: GNU Parallel 可用 $((available_kib / 1024))MiB（宿主机或虚拟机视图），启动门槛 ${PARALLEL_MIN_FREE_MEMORY_MIB}MiB"
+
+  local memory_current memory_max memory_limit
+  if [[ -r /sys/fs/cgroup/memory.current && -r /sys/fs/cgroup/memory.max ]] &&
+    read -r memory_current </sys/fs/cgroup/memory.current &&
+    read -r memory_max </sys/fs/cgroup/memory.max &&
+    [[ "$memory_current" =~ ^[0-9]+$ ]]; then
+    memory_limit="未限制"
+    if [[ "$memory_max" =~ ^[0-9]+$ ]]; then
+      memory_limit="$((memory_max / 1024 / 1024))MiB"
+    fi
+    log "容器内存: 当前使用 $((memory_current / 1024 / 1024))MiB，上限 $memory_limit"
+  fi
+
+  if (( available_kib < PARALLEL_MIN_FREE_MEMORY_MIB * 1024 )); then
+    error "GNU Parallel 可用内存不足，已停止以避免等待；请释放宿主机或虚拟机内存后重试"
+    return 1
   fi
   return 0
 }
@@ -236,7 +313,7 @@ execute_vips_conversion() {
   local input_file="$1"
   local output_file="$2"
   
-  vips tiffsave "$input_file" "$output_file" $VIPS_ARGS >/dev/null 2>&1
+  vips tiffsave "$input_file" "$output_file" $VIPS_ARGS >/dev/null
 }
 
 # 缓存模式处理文件（优化磁盘空间管理）
@@ -267,6 +344,7 @@ process_file_cached() {
   local cache_output="$job_dir/output.tif"
   
   # 步骤1: 复制到缓存
+  log "复制到缓存: $input_file"
   if ! cp "$input_file" "$cache_input" 2>/dev/null; then
     error "复制到缓存失败: $input_file"
     cleanup_cache_job "$job_dir"
@@ -274,6 +352,7 @@ process_file_cached() {
   fi
   
   # 步骤2: 执行转换
+  log "开始转换: $input_file"
   if ! execute_vips_conversion "$cache_input" "$cache_output"; then
     error "图像转换失败: $input_file"
     cleanup_cache_job "$job_dir"
@@ -281,6 +360,7 @@ process_file_cached() {
   fi
   
   # 步骤3: 原子移动到最终位置
+  log "写入输出: $input_file -> $output_file"
   if ! atomic_move "$cache_output" "$output_file"; then
     error "复制回目标失败: $input_file"
     cleanup_cache_job "$job_dir"
@@ -308,8 +388,10 @@ process_file_direct() {
   local temp_file="$output_file.tmp.$$"
   
   # 执行转换
+  log "开始转换: $input_file"
   if execute_vips_conversion "$input_file" "$temp_file"; then
     # 原子移动
+    log "写入输出: $input_file -> $output_file"
     if mv "$temp_file" "$output_file" 2>/dev/null; then
       return 0
     else
@@ -326,11 +408,23 @@ process_file_direct() {
 
 # 处理文件包装器
 process_file_wrapper() {
+  local input_file="$1"
+  local started=$SECONDS
+  local status=0
+
+  log "开始处理: $input_file"
   if [[ "$USE_LOCAL_CACHE" == "true" ]]; then
-    process_file_cached "$@"
+    process_file_cached "$@" || status=$?
   else
-    process_file_direct "$@"
+    process_file_direct "$@" || status=$?
   fi
+
+  if (( status == 0 )); then
+    log "处理完成: $input_file，耗时 $((SECONDS - started)) 秒"
+  else
+    error "处理失败: $input_file，耗时 $((SECONDS - started)) 秒，退出码 $status"
+  fi
+  return "$status"
 }
 
 # ============================== 文件发现和状态检查 ==============================
@@ -598,6 +692,14 @@ initialize_environment() {
     error "THREADS 必须为正整数: $THREADS"
     exit 1
   fi
+  if [[ ! "$VIPS_CONCURRENCY" =~ ^[1-9][0-9]{0,3}$ || "$VIPS_CONCURRENCY" -gt 1024 ]]; then
+    error "VIPS_CONCURRENCY 必须为 1 到 1024 的整数: $VIPS_CONCURRENCY"
+    exit 1
+  fi
+  if [[ ! "$PROGRESS_LOG_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
+    error "PROGRESS_LOG_INTERVAL 必须为正整数: $PROGRESS_LOG_INTERVAL"
+    exit 1
+  fi
   if [[ "$USE_LOCAL_CACHE" == "true" && ! "$MAX_CACHE_FILES" =~ ^[1-9][0-9]*$ ]]; then
     error "MAX_CACHE_FILES 必须为正整数: $MAX_CACHE_FILES"
     exit 1
@@ -689,7 +791,8 @@ execute_parallel_processing() {
   fi
   
   log "开始使用 $parallel_jobs 个并行任务进行处理..."
-  log "可以使用 'tail -f $JOB_LOG' 查看详细任务日志"
+  log "并发配置: $parallel_jobs 个图像任务，每个 libvips 进程的计算线程上限为 $VIPS_CONCURRENCY"
+  log "可以使用 'tail -f $JOB_LOG' 查看已结束任务的记录"
 
   # GNU Parallel probes /dev/tty for progress output, which Docker may not provide.
   if [[ -t 2 ]] && { : </dev/tty; } 2>/dev/null; then
@@ -708,8 +811,19 @@ execute_parallel_processing() {
       return 1
     fi
   fi
+
+  check_parallel_memory || return 1
+
+  if ! : >"$JOB_LOG"; then
+    error "无法写入任务日志: $JOB_LOG"
+    return 1
+  fi
+  log "启动 GNU Parallel 调度，内存门槛=${PARALLEL_MIN_FREE_MEMORY_MIB}MiB，每 ${PROGRESS_LOG_INTERVAL} 秒报告批次进度"
+  report_parallel_progress "$file_count" "$SECONDS" </dev/null &
+  PROGRESS_PID=$!
   
   # 执行并行处理，优化参数减少缓冲区使用
+  local parallel_status=0
   if printf "%s\0" "${files_ref[@]}" | \
     parallel \
       --null \
@@ -717,8 +831,15 @@ execute_parallel_processing() {
       -j "$parallel_jobs" \
       --joblog "$JOB_LOG" \
       --ungroup \
-      --memfree 100M \
+      --memfree "${PARALLEL_MIN_FREE_MEMORY_MIB}M" \
       process_file_wrapper {}; then
+    parallel_status=0
+  else
+    parallel_status=$?
+  fi
+  stop_progress_monitor
+
+  if (( parallel_status == 0 )); then
     log "✅ 所有文件处理完成"
     
     # 清理Parallel临时文件
@@ -786,6 +907,8 @@ export -f ensure_directory safe_cleanup should_process_file
 export -f log error debug get_base_name check_disk_space cleanup_cache_job
 export INPUT_DIR OUTPUT_DIR LOCAL_CACHE_DIR USE_LOCAL_CACHE LOG_LEVEL VIPS_ARGS
 export MIN_FREE_SPACE_MB MAX_CACHE_FILES
+# Limit libvips threads independently of the number of GNU Parallel jobs.
+export VIPS_CONCURRENCY
 
 # 脚本入口
 main "$@"

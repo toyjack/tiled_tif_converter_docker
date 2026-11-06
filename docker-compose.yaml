@@ -13,7 +13,9 @@ services:
     
     environment:
       - THREADS=${THREADS:-4}
+      - VIPS_CONCURRENCY=${VIPS_CONCURRENCY:-1}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - PROGRESS_LOG_INTERVAL=${PROGRESS_LOG_INTERVAL:-30}
       - TZ=${TZ:-UTC}
       - USE_LOCAL_CACHE=${USE_LOCAL_CACHE:-true}
       - MAX_CACHE_FILES=${MAX_CACHE_FILES:-20}
