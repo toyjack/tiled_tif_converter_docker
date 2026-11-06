@@ -17,8 +17,11 @@ RUN apk add --no-cache \
     && rm -rf /var/cache/apk/* \
     && rm -rf /tmp/*
 
-# 创建必要的目录
-RUN mkdir -p /app/input /app/output /app/logs
+# Create the runtime user before COPY --chown and prepare writable directories.
+RUN addgroup -S -g 1000 vipsuser \
+    && adduser -S -D -u 1000 -G vipsuser vipsuser \
+    && mkdir -p /app/input /app/output /app/logs /app/cache /app/tmp \
+    && chown -R vipsuser:vipsuser /app
 
 # 设置工作目录
 WORKDIR /app
@@ -31,6 +34,8 @@ RUN chmod +x /app/process_images.sh
 ENV INPUT_DIR=/app/input \
     OUTPUT_DIR=/app/output \
     THREADS=4
+
+USER vipsuser:vipsuser
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \

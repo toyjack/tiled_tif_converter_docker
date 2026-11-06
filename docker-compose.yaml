@@ -1,6 +1,8 @@
 services:
   image-processor:
-    build: .
+    build:
+      context: .
+      dockerfile: dockerfile
     container_name: libvips-processor
     restart: "no"
     
@@ -21,7 +23,7 @@ services:
       resources:
         limits:
           memory: ${MEMORY_LIMIT:-2G}
-          cpus: '${CPU_LIMIT}'
+          cpus: '${CPU_LIMIT:-6.0}'
         reservations:
           memory: 512M
           cpus: '1.0'
