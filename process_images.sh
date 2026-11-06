@@ -32,7 +32,8 @@ JOB_LOG=""
 
 # 处理配置
 readonly VIPS_ARGS="--compression=deflate --tile --tile-width=256 --tile-height=256 --pyramid"
-readonly PROGRESS_INTERVAL=100
+readonly PROGRESS_INTERVAL=1000
+readonly SCAN_PROGRESS_SECONDS=5
 
 # ============================== 错误处理 ==============================
 
@@ -347,16 +348,43 @@ process_file_wrapper() {
 
 # ============================== 文件发现和状态检查 ==============================
 
+# mapfile callbacks share the discovery function's local progress deadline.
+report_input_scan_progress() {
+  if (( SECONDS >= scan_next_progress )); then
+    log "已发现 $(($1 + 1)) 个TIFF文件，仍在扫描输入目录..."
+    scan_next_progress=$((SECONDS + SCAN_PROGRESS_SECONDS))
+  fi
+  return 0
+}
+
 # 查找所有TIFF文件
 find_tiff_files() {
   local -n files_ref=$1
-  
-  if ! mapfile -d '' files_ref < <(find "$INPUT_DIR" -type f \( -iname "*.tif" -o -iname "*.tiff" \) -print0 2>/dev/null); then
-    error "查找TIFF文件失败"
+  local scan_started=$SECONDS
+  local scan_next_progress=$((SECONDS + SCAN_PROGRESS_SECONDS))
+  local scan_fd
+  local read_status=0
+  local scan_status=0
+
+  log "正在扫描输入目录: $INPUT_DIR"
+
+  # Keep find's PID so permission and traversal errors cannot look like empty input.
+  if ! exec {scan_fd}< <(find "$INPUT_DIR" \( -iname "*.tif" -o -iname "*.tiff" \) -type f -print0); then
+    error "无法启动输入目录扫描: $INPUT_DIR"
     return 1
   fi
-  
-  log "找到 ${#files_ref[@]} 个TIFF文件"
+  local scan_pid=$!
+  mapfile -d '' -C report_input_scan_progress -c "$PROGRESS_INTERVAL" files_ref <&"$scan_fd" || read_status=$?
+  exec {scan_fd}<&-
+  wait "$scan_pid" || scan_status=$?
+
+  if (( read_status != 0 || scan_status != 0 )); then
+    error "查找TIFF文件失败: $INPUT_DIR，请检查上方的文件系统错误"
+    files_ref=()
+    return 1
+  fi
+
+  log "找到 ${#files_ref[@]} 个TIFF文件，输入扫描耗时 $((SECONDS - scan_started)) 秒"
   return 0
 }
 
@@ -364,30 +392,51 @@ find_tiff_files() {
 scan_completed_files() {
   local -n processed_ref=$1
   local scan_count=0
-  
+  local scan_started=$SECONDS
+  local next_progress_report=$((SECONDS + SCAN_PROGRESS_SECONDS))
+  local normalized_output_dir="${OUTPUT_DIR%/}/"
+  local output_file relative_path base_name
+  local scan_fd
+  local scan_status=0
+  local is_debug=false
+  [[ "${LOG_LEVEL}" == "DEBUG" ]] && is_debug=true
+
   log "正在扫描输出目录..."
-  
-  # 直接使用进程替换扫描输出目录
-  # 使用 || true 确保即使没有找到文件也不会出错
+
+  if ! exec {scan_fd}< <(find "$OUTPUT_DIR" -name "*.tif" -type f -print0); then
+    error "无法启动输出目录扫描: $OUTPUT_DIR"
+    return 1
+  fi
+  local scan_pid=$!
+
   while IFS= read -r -d '' output_file; do
     # 跳过空行
     [[ -n "$output_file" ]] || continue
     
-    local base_name
-    base_name=$(get_base_name "$output_file" "$OUTPUT_DIR")
+    # Parameter expansion avoids spawning one subshell per completed file.
+    relative_path="${output_file#"$normalized_output_dir"}"
+    base_name="${relative_path%.*}"
     processed_ref["$base_name"]=1
     ((scan_count++))
-    
-    debug "输出映射: $output_file -> $base_name"
-    
-    if [[ $((scan_count % PROGRESS_INTERVAL)) -eq 0 ]]; then
-      log "已扫描输出文件: $scan_count 个..."
+
+    if (( SECONDS >= next_progress_report )); then
+      log "已扫描输出文件: $scan_count 个，耗时 $((SECONDS - scan_started)) 秒..."
+      next_progress_report=$((SECONDS + SCAN_PROGRESS_SECONDS))
     fi
-    
-    debug "已完成文件: $base_name"
-  done < <(find "$OUTPUT_DIR" -type f -name "*.tif" -print0 2>/dev/null || true)
-  
-  log "输出目录扫描完成，找到 $scan_count 个已完成文件"
+
+    if $is_debug; then
+      debug "输出映射: $output_file -> $base_name"
+    fi
+  done <&"$scan_fd"
+  exec {scan_fd}<&-
+  wait "$scan_pid" || scan_status=$?
+
+  if (( scan_status != 0 )); then
+    error "扫描输出目录失败: $OUTPUT_DIR，请检查上方的文件系统错误"
+    return 1
+  fi
+
+  log "输出目录扫描完成，找到 $scan_count 个已完成文件，耗时 $((SECONDS - scan_started)) 秒"
   
   # 调试：显示已处理文件列表
   if [[ "${LOG_LEVEL}" == "DEBUG" && $scan_count -gt 0 ]]; then
@@ -428,6 +477,9 @@ analyze_file_status() {
   local total_files=${#all_files_ref[@]}
   local normalized_input_dir="${INPUT_DIR%/}/"
   local is_debug=false
+  local scan_started=$SECONDS
+  local next_progress_time=$((SECONDS + SCAN_PROGRESS_SECONDS))
+  local input_file relative_path input_base
   
   # 预先判断是否为DEBUG模式，避免重复检查
   [[ "${LOG_LEVEL}" == "DEBUG" ]] && is_debug=true
@@ -444,14 +496,17 @@ analyze_file_status() {
     
     # 优化进度报告：使用预计算阈值
     if [[ $processed_count -eq $next_progress_report ]]; then
-      log "已检查 $processed_count/$total_files 个文件..."
+      if (( SECONDS >= next_progress_time )); then
+        log "已检查 $processed_count/$total_files 个文件..."
+        next_progress_time=$((SECONDS + SCAN_PROGRESS_SECONDS))
+      fi
       next_progress_report=$((processed_count + PROGRESS_INTERVAL))
     fi
     
     # 高效的内联路径处理
-    local relative_path="${input_file#$normalized_input_dir}"
+    relative_path="${input_file#"$normalized_input_dir"}"
     [[ "$relative_path" == "$input_file" ]] && relative_path="${input_file##*/}"
-    local input_base="${relative_path%.*}"
+    input_base="${relative_path%.*}"
     
     # 条件调试输出
     $is_debug && debug "输入映射: $input_file -> $input_base"
@@ -469,7 +524,7 @@ analyze_file_status() {
   # 批量复制到目标数组
   pending_files_ref=("${pending_temp[@]}")
   
-  log "文件检查完成，共检查了 $processed_count 个文件"
+  log "文件检查完成，共检查了 $processed_count 个文件，耗时 $((SECONDS - scan_started)) 秒"
 }
 
 # 为大文件集合提供的并行版本（实验性）
@@ -692,7 +747,7 @@ main() {
   
   # 扫描已完成的文件
   declare -A processed_files
-  scan_completed_files processed_files
+  scan_completed_files processed_files || exit 1
   
   # 分析文件状态
   local pending_files=()
