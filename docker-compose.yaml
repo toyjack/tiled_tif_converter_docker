@@ -16,6 +16,7 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TZ=${TZ:-UTC}
       - USE_LOCAL_CACHE=${USE_LOCAL_CACHE:-true}
+      - MAX_CACHE_FILES=${MAX_CACHE_FILES:-20}
       - CPU_LIMIT=${CPU_LIMIT:-6.0}
     
     # 资源限制（CPU 限制适度高于线程数以避免资源竞争）

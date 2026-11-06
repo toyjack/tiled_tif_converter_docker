@@ -44,7 +44,7 @@ Copy-Item .env.example .env
 New-Item -ItemType Directory -Force -Path input, output, logs | Out-Null
 ```
 
-将 TIFF 文件放入 `input/`，按需编辑 `.env`。目前建议先使用直接模式，以避开缓存模式的同名文件冲突：
+Place TIFF files in `input/` and edit `.env`. Use direct mode for local storage, or enable caching for remote input storage:
 
 ```dotenv
 USE_LOCAL_CACHE=false
@@ -77,18 +77,19 @@ docker compose logs -f image-processor
 | `LOG_FOLDER` | `./logs` | 当前挂载至 `/tmp/logs`；任务日志位置尚未统一，见下文。 |
 | `THREADS` | `4` | GNU Parallel 并行任务数；目前没有自动检测或上限校验。 |
 | `USE_LOCAL_CACHE` | `true` | 是否启用本地缓存。脚本未设置该变量时默认 `false`，与 Compose 不同。 |
+| `MAX_CACHE_FILES` | `20` | Maximum concurrent cached input files. Cached jobs use `min(THREADS, MAX_CACHE_FILES)`; direct mode uses `THREADS`. Both settings must be positive integers when used. |
 | `MEMORY_LIMIT` | `2G` | 容器内存上限。 |
 | `CPU_LIMIT` | `6.0` | 容器 CPU 配额，与并行任务数分别配置。 |
 | `LOG_LEVEL` | `INFO` | `DEBUG` 增加调试信息；目前没有完整的日志级别过滤。 |
 | `TZ` | `UTC` | 传入容器的时区变量；`.env.example` 中为 `Asia/Tokyo`。 |
 
-缓存模式先复制输入到容器本地目录，转换后再复制回输出位置；直接模式在输出目录中生成临时文件，成功后重命名为最终文件。
+Cached jobs use separate temporary directories and remove both cached input and output when each job finishes. They check free space on the actual cache filesystem; successful per-file checks appear only at `LOG_LEVEL=DEBUG`. Direct mode writes a temporary file in the output directory and renames it after conversion succeeds.
 
 ### 日志与已知限制
 
 - 普通状态和错误消息通过 `docker compose logs` 查看。GNU Parallel 的任务记录默认写入容器内 `/app/logs/tiff_conversion.log`，当前不会自动保存到宿主机 `LOG_FOLDER`。需要保留时，应在删除或重建容器前使用 `docker cp` 导出到未挂载进容器的独立宿主机目录；当前未提供历史记录保留策略。
 - 脚本会清理 `/tmp` 下超过 30 分钟的文件及空目录，可能影响 `/tmp/logs` 挂载中的宿主机文件。请勿将 `LOG_FOLDER` 用于长期归档，或让它包含输入、输出目录。
-- 缓存模式中，不同子目录的同名文件可能共用缓存路径。修复前建议使用 `USE_LOCAL_CACHE=false`。同一目录中同时存在 `sample.tif` 和 `sample.tiff` 时，两种模式都会映射到同一个输出文件，应避免这种命名。
+- In both modes, `sample.tif` and `sample.tiff` in the same input directory map to the same output path. Avoid this naming collision.
 - 跳过逻辑基于输出文件是否存在，不验证其完整性；需要重做时，先确认并移走对应旧输出。
 - 错误处理和健康检查仍待完善。待办事项见 [开发计划](DEVELOPMENT_PLAN.md)。
 
@@ -155,7 +156,7 @@ Copy-Item .env.example .env
 New-Item -ItemType Directory -Force -Path input, output, logs | Out-Null
 ```
 
-TIFF ファイルを `input/` に配置し、必要に応じて `.env` を編集します。現在はキャッシュ内での同名ファイルの競合を避けるため、直接処理を推奨します。
+Place TIFF files in `input/` and edit `.env`. Use direct mode for local storage, or enable caching for remote input storage:
 
 ```dotenv
 USE_LOCAL_CACHE=false
@@ -188,18 +189,19 @@ docker compose logs -f image-processor
 | `LOG_FOLDER` | `./logs` | 現在は `/tmp/logs` にマウントします。ジョブログの保存先とは未統一です。 |
 | `THREADS` | `4` | GNU Parallel の並列ジョブ数。自動検出や上限の検証は未実装です。 |
 | `USE_LOCAL_CACHE` | `true` | ローカルキャッシュの有効・無効。スクリプトでは未設定時に `false` となり、Compose と異なります。 |
+| `MAX_CACHE_FILES` | `20` | Maximum concurrent cached input files. Cached jobs use `min(THREADS, MAX_CACHE_FILES)`; direct mode uses `THREADS`. Both settings must be positive integers when used. |
 | `MEMORY_LIMIT` | `2G` | コンテナーのメモリー上限。 |
 | `CPU_LIMIT` | `6.0` | コンテナーの CPU 割り当て上限。並列ジョブ数とは別に設定します。 |
 | `LOG_LEVEL` | `INFO` | `DEBUG` で詳細情報を追加します。ログレベルによる完全なフィルタリングは未実装です。 |
 | `TZ` | `UTC` | コンテナーに渡すタイムゾーン変数。`.env.example` では `Asia/Tokyo` です。 |
 
-キャッシュモードでは、入力をコンテナーのローカルディレクトリーにコピーして変換し、出力先へコピーします。直接処理では、出力ディレクトリーに一時ファイルを作成し、成功後に最終ファイル名へ変更します。
+Cached jobs use separate temporary directories and remove both cached input and output when each job finishes. They check free space on the actual cache filesystem; successful per-file checks appear only at `LOG_LEVEL=DEBUG`. Direct mode writes a temporary file in the output directory and renames it after conversion succeeds.
 
 ### ログと既知の制約
 
 - 通常の状態メッセージとエラーは `docker compose logs` で確認できます。GNU Parallel のジョブログは、既定でコンテナー内の `/app/logs/tiff_conversion.log` に保存され、現在はホストの `LOG_FOLDER` に自動保存されません。保存が必要な場合は、コンテナーを削除・再作成する前に `docker cp` でコンテナーにマウントしていない独立したホストディレクトリーへコピーしてください。履歴の保持ポリシーは未実装です。
 - スクリプトは `/tmp` 配下の更新から 30 分を超えたファイルと空ディレクトリーを削除します。`/tmp/logs` にマウントされたホスト側のファイルも影響を受ける可能性があります。`LOG_FOLDER` を長期保管に使用したり、その配下に入力・出力ディレクトリーを置いたりしないでください。
-- キャッシュモードでは、異なるサブディレクトリーの同名ファイルが同じキャッシュパスを使用する可能性があります。修正までは `USE_LOCAL_CACHE=false` を推奨します。同一ディレクトリーに `sample.tif` と `sample.tiff` がある場合は、どちらのモードでも出力先が重複するため、この命名を避けてください。
+- In both modes, `sample.tif` and `sample.tiff` in the same input directory map to the same output path. Avoid this naming collision.
 - スキップ判定では出力ファイルの存在のみを確認し、完全性は検証しません。再変換する場合は、該当する既存出力を確認してから別の場所へ移動してください。
 - エラー処理とヘルスチェックの改善は継続中です。未完了の作業は [開発計画](DEVELOPMENT_PLAN.md) を参照してください。
 

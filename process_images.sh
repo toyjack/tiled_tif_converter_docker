@@ -21,7 +21,7 @@ readonly DEFAULT_LOG_DIR=${LOG_BASE_DIR:-/app/logs}        # 默认日志基础�
 
 # 磁盘空间配置
 readonly MIN_FREE_SPACE_MB=${MIN_FREE_SPACE_MB:-500}    # 降低最小空间要求到500MB
-readonly MAX_CACHE_FILES=${MAX_CACHE_FILES:-20}         # 减少最大同时缓存文件数
+readonly MAX_CACHE_FILES=${MAX_CACHE_FILES:-20}         # Maximum concurrent cached input files
 
 # 运行时动态设置的目录变量（初始化时确定）
 ACTIVE_CACHE_DIR=""
@@ -91,6 +91,7 @@ safe_cleanup() {
 check_disk_space() {
   local dir="$1"
   local min_mb="${2:-$MIN_FREE_SPACE_MB}"
+  local success_level="${3:-INFO}"
   
   # 确保目录存在
   [[ ! -d "$dir" ]] && mkdir -p "$dir" 2>/dev/null
@@ -104,7 +105,9 @@ check_disk_space() {
     return 1
   fi
   
-  log "磁盘空间检查: $dir 可用 ${available_mb}MB"
+  if [[ "$success_level" != "DEBUG" || "$LOG_LEVEL" == "DEBUG" ]]; then
+    log "磁盘空间检查: $dir 可用 ${available_mb}MB" "$success_level"
+  fi
   return 0
 }
 
@@ -151,30 +154,11 @@ cleanup_temp_files() {
   fi
 }
 
-# 管理缓存文件数量
-manage_cache_size() {
-  local cache_dir="$1"
-  local max_files="$2"
-  
-  if [[ ! -d "$cache_dir" ]]; then
-    return 0
-  fi
-  
-  # Keep timestamp/path records NUL-delimited so unusual filenames remain intact.
-  local cache_files=()
-  mapfile -d '' -t cache_files < <(
-    find "$cache_dir" -type f -printf '%T@ %p\0' | sort -z -n
-  )
-  local current_files=${#cache_files[@]}
-  
-  if [[ "$current_files" -gt "$max_files" ]]; then
-    log "缓存文件过多($current_files)，清理最旧的文件..."
-    # Remove the oldest entries, keeping the newest max_files files.
-    local cache_file
-    for cache_file in "${cache_files[@]:0:$((current_files - max_files))}"; do
-      rm -f -- "${cache_file#* }"
-    done
-  fi
+# Each worker removes only the files in its own mktemp directory.
+cleanup_cache_job() {
+  local job_dir="$1"
+  safe_cleanup "$job_dir/input.tif" "$job_dir/output.tif"
+  rmdir -- "$job_dir" 2>/dev/null || true
 }
 
 # ============================== 路径处理函数 ==============================
@@ -265,45 +249,46 @@ process_file_cached() {
   should_process_file "$output_file" || return 0
   
   # 检查磁盘空间
-  if ! check_disk_space "/tmp" 500; then  # 至少需要500MB
+  if ! check_disk_space "$LOCAL_CACHE_DIR" "$MIN_FREE_SPACE_MB" DEBUG; then
     error "缓存空间不足，跳过文件: $input_file"
     return 1
   fi
   
-  # 管理缓存大小
-  manage_cache_size "$LOCAL_CACHE_DIR" "$MAX_CACHE_FILES"
-  
   # 确保输出目录存在
   ensure_directory "$(dirname "$output_file")" || return 1
   
-  # 构建缓存路径
-  local filename
-  filename=$(basename "$input_file")
-  local cache_input="$LOCAL_CACHE_DIR/input/$filename"
-  local cache_output="$LOCAL_CACHE_DIR/output/${filename%.*}.tif"
+  # Isolate active files so concurrent jobs cannot overwrite or evict each other.
+  local job_dir
+  job_dir=$(mktemp -d "$LOCAL_CACHE_DIR/job.XXXXXX") || {
+    error "无法创建任务缓存目录: $input_file"
+    return 1
+  }
+  local cache_input="$job_dir/input.tif"
+  local cache_output="$job_dir/output.tif"
   
   # 步骤1: 复制到缓存
   if ! cp "$input_file" "$cache_input" 2>/dev/null; then
     error "复制到缓存失败: $input_file"
+    cleanup_cache_job "$job_dir"
     return 1
   fi
   
   # 步骤2: 执行转换
   if ! execute_vips_conversion "$cache_input" "$cache_output"; then
     error "图像转换失败: $input_file"
-    safe_cleanup "$cache_input" "$cache_output"
+    cleanup_cache_job "$job_dir"
     return 1
   fi
   
   # 步骤3: 原子移动到最终位置
   if ! atomic_move "$cache_output" "$output_file"; then
     error "复制回目标失败: $input_file"
-    safe_cleanup "$cache_input" "$cache_output"
+    cleanup_cache_job "$job_dir"
     return 1
   fi
   
   # 步骤4: 立即清理缓存（减少磁盘占用）
-  safe_cleanup "$cache_input"
+  cleanup_cache_job "$job_dir"
   return 0
 }
 
@@ -608,6 +593,15 @@ analyze_file_status_parallel() {
 # 初始化环境
 initialize_environment() {
   log "当前日志级别: $LOG_LEVEL"
+
+  if [[ ! "$THREADS" =~ ^[1-9][0-9]*$ ]]; then
+    error "THREADS 必须为正整数: $THREADS"
+    exit 1
+  fi
+  if [[ "$USE_LOCAL_CACHE" == "true" && ! "$MAX_CACHE_FILES" =~ ^[1-9][0-9]*$ ]]; then
+    error "MAX_CACHE_FILES 必须为正整数: $MAX_CACHE_FILES"
+    exit 1
+  fi
   
   # 验证输入目录
   if [[ ! -d "$INPUT_DIR" ]]; then
@@ -666,16 +660,12 @@ initialize_environment() {
       if [[ -d "$LOCAL_CACHE_DIR" ]]; then
         find "$LOCAL_CACHE_DIR" -mindepth 1 -delete 2>/dev/null || true
       fi
-      ensure_directory "$LOCAL_CACHE_DIR/input" || {
-        log "⚠️ 无法创建缓存目录，切换到直接模式"
-        USE_LOCAL_CACHE=false
-      }
-      ensure_directory "$LOCAL_CACHE_DIR/output" || {
+      ensure_directory "$LOCAL_CACHE_DIR" || {
         log "⚠️ 无法创建缓存目录，切换到直接模式"
         USE_LOCAL_CACHE=false
       }
       
-      [[ "$USE_LOCAL_CACHE" == "true" ]] && log "缓存配置: 最大文件数=$MAX_CACHE_FILES，最小剩余空间=${MIN_FREE_SPACE_MB}MB"
+      [[ "$USE_LOCAL_CACHE" == "true" ]] && log "缓存配置: 最大并行文件数=$MAX_CACHE_FILES，最小剩余空间=${MIN_FREE_SPACE_MB}MB"
     else
       log "⚠️ 缓存目录空间不足，切换到直接模式"
       USE_LOCAL_CACHE=false
@@ -690,8 +680,15 @@ execute_parallel_processing() {
   local -n files_ref=$1
   local file_count=${#files_ref[@]}
   local progress_args=()
+  local parallel_jobs="$THREADS"
+
+  # Bound active cached inputs instead of deleting another worker's files.
+  if [[ "$USE_LOCAL_CACHE" == "true" && "$parallel_jobs" -gt "$MAX_CACHE_FILES" ]]; then
+    parallel_jobs="$MAX_CACHE_FILES"
+    log "为限制缓存占用，将并行任务数从 $THREADS 调整为 $parallel_jobs"
+  fi
   
-  log "开始使用 $THREADS 个线程进行并行处理..."
+  log "开始使用 $parallel_jobs 个并行任务进行处理..."
   log "可以使用 'tail -f $JOB_LOG' 查看详细任务日志"
 
   # GNU Parallel probes /dev/tty for progress output, which Docker may not provide.
@@ -717,7 +714,7 @@ execute_parallel_processing() {
     parallel \
       --null \
       "${progress_args[@]}" \
-      -j "$THREADS" \
+      -j "$parallel_jobs" \
       --joblog "$JOB_LOG" \
       --ungroup \
       --memfree 100M \
@@ -786,7 +783,7 @@ main() {
 export -f process_file_wrapper process_file_cached process_file_direct
 export -f get_output_path atomic_move execute_vips_conversion
 export -f ensure_directory safe_cleanup should_process_file
-export -f log error debug get_base_name check_disk_space manage_cache_size
+export -f log error debug get_base_name check_disk_space cleanup_cache_job
 export INPUT_DIR OUTPUT_DIR LOCAL_CACHE_DIR USE_LOCAL_CACHE LOG_LEVEL VIPS_ARGS
 export MIN_FREE_SPACE_MB MAX_CACHE_FILES
 
