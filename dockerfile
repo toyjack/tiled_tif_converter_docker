@@ -12,6 +12,7 @@ RUN apk add --no-cache \
     vips-tools=8.16.1-r0 \
     parallel \
     bash \
+    findutils \
     pv \
     tini \
     && rm -rf /var/cache/apk/* \

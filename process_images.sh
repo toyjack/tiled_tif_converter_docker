@@ -160,18 +160,20 @@ manage_cache_size() {
     return 0
   fi
   
-  # 统计当前缓存文件数
-  local current_files
-  current_files=$(find "$cache_dir" -type f | wc -l)
+  # Keep timestamp/path records NUL-delimited so unusual filenames remain intact.
+  local cache_files=()
+  mapfile -d '' -t cache_files < <(
+    find "$cache_dir" -type f -printf '%T@ %p\0' | sort -z -n
+  )
+  local current_files=${#cache_files[@]}
   
   if [[ "$current_files" -gt "$max_files" ]]; then
     log "缓存文件过多($current_files)，清理最旧的文件..."
-    # 删除最旧的文件，保留最新的max_files个
-    find "$cache_dir" -type f -printf '%T@ %p\n' | \
-      sort -n | \
-      head -n -$max_files | \
-      cut -d' ' -f2- | \
-      xargs -r rm -f
+    # Remove the oldest entries, keeping the newest max_files files.
+    local cache_file
+    for cache_file in "${cache_files[@]:0:$((current_files - max_files))}"; do
+      rm -f -- "${cache_file#* }"
+    done
   fi
 }
 
@@ -687,9 +689,17 @@ initialize_environment() {
 execute_parallel_processing() {
   local -n files_ref=$1
   local file_count=${#files_ref[@]}
+  local progress_args=()
   
   log "开始使用 $THREADS 个线程进行并行处理..."
   log "可以使用 'tail -f $JOB_LOG' 查看详细任务日志"
+
+  # GNU Parallel probes /dev/tty for progress output, which Docker may not provide.
+  if [[ -t 2 ]] && { : </dev/tty; } 2>/dev/null; then
+    progress_args=(--bar --eta)
+  else
+    log "未检测到可用终端，禁用动态进度条"
+  fi
   
   # 最终磁盘空间检查
   if ! check_disk_space "$ACTIVE_PARALLEL_DIR" 100; then
@@ -706,8 +716,7 @@ execute_parallel_processing() {
   if printf "%s\0" "${files_ref[@]}" | \
     parallel \
       --null \
-      --bar \
-      --eta \
+      "${progress_args[@]}" \
       -j "$THREADS" \
       --joblog "$JOB_LOG" \
       --ungroup \
