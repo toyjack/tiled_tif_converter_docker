@@ -35,7 +35,7 @@ ENV INPUT_DIR=/app/input \
     OUTPUT_DIR=/app/output \
     THREADS=4
 
-USER vipsuser:vipsuser
+# USER vipsuser:vipsuser
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
