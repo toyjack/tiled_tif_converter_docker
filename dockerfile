@@ -12,6 +12,7 @@ RUN apk add --no-cache \
     vips-tools=8.16.1-r0 \
     parallel \
     bash \
+    python3 \
     findutils \
     pv \
     tini \
@@ -29,6 +30,7 @@ WORKDIR /app
 
 # 复制处理脚本并设置权限
 COPY --chown=vipsuser:vipsuser process_images.sh /app/
+COPY --chown=vipsuser:vipsuser scan_completed_images.py /app/
 RUN chmod +x /app/process_images.sh
 
 # 设置环境变量
